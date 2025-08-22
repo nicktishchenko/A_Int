@@ -1,0 +1,10 @@
+# Ignore everything in the repository root by default
+*
+
+# Keep the gitignore itself
+!.gitignore
+
+# Keep these notebooks
+!image_processing.ipynb
+!serial_extractor.ipynb
+
