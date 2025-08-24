@@ -10,3 +10,6 @@
 
 # Keep Python dependencies file
 !requirements.txt
+
+# Keep README
+!README.md
