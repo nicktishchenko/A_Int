@@ -8,3 +8,5 @@
 !image_processing.ipynb
 !serial_extractor.ipynb
 
+# Keep Python dependencies file
+!requirements.txt
