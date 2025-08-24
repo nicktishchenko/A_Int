@@ -13,3 +13,6 @@
 
 # Keep README
 !README.md
+
+# Keep Python scripts
+!image_processing.py
