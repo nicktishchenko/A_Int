@@ -25,6 +25,8 @@ from PIL import Image
 import cv2
 import easyocr
 import zipcodes
+import time
+import csv
 
 plt.style.use("ggplot")
 
@@ -67,6 +69,9 @@ else:
 
 print("Environment setup complete with target schema:")
 print(EXPECTED_COLUMNS)
+
+# Global container to capture last computed serial candidates across cells
+SERIAL_CANDIDATES_LAST = []
 
 # Visualization helper with semantic highlighting
 CATEGORY_COLORS = {
@@ -170,17 +175,35 @@ def visualize_ocr(
             cv2.LINE_AA,
         )
     if show:
-        img_rgb = cv2.cvtColor(draw, cv2.COLOR_BGR2RGB)
-        plt.figure(figsize=(13, 9))
-        plt.imshow(img_rgb)
-        plt.axis("off")
-        plt.title(
-            title
-            or "OCR Visualization (serial=green, event=orange, name=blue, addr=violet)"
-        )
-        plt.show()
+        # Visualization disabled for performance benchmarking
+        # img_rgb = cv2.cvtColor(draw, cv2.COLOR_BGR2RGB)
+        # plt.figure(figsize=(13, 9))
+        # plt.imshow(img_rgb)
+        # plt.axis("off")
+        # plt.title(
+        #     title
+        #     or "OCR Visualization (serial=green, event=orange, name=blue, addr=violet)"
+        # )
+        # plt.show()
+        pass
     return draw
 
+
+# Lightweight OCR-only timing logger (writes per-cell CSVs under reports/)
+def log_ocr_time(
+    cell_label: str, engine: str, device: str, source_file: str, ocr_time: float
+):
+    try:
+        os.makedirs("reports", exist_ok=True)
+        path = os.path.join("reports", f"ocr_times_{cell_label}.csv")
+        file_exists = os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            w = csv.writer(f)
+            if not file_exists:
+                w.writerow(["source_file", "engine", "device", "ocr_time_sec"])
+            w.writerow([source_file, engine, device, round(ocr_time, 6)])
+    except Exception as e:
+        print(f"Warning: failed to write OCR time for {source_file} -> {e}")
 
 
 # %% cellUniqueIdByVincent="a681b"
@@ -284,7 +307,6 @@ def diagnose_file_timestamps(file_path):
 
     except Exception as e:
         print(f"Error reading timestamps: {e}")
-
 
 
 # %% cellUniqueIdByVincent="30683"
@@ -835,12 +857,14 @@ for filename in file_list:
                 )
 
             try:
-                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                plt.figure(figsize=(12, 8))
-                plt.imshow(img_rgb)
-                plt.axis("off")
-                plt.title(f"OCR Results for {filename}")
-                plt.show()
+                # Visualization disabled for performance benchmarking
+                # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # plt.figure(figsize=(12, 8))
+                # plt.imshow(img_rgb)
+                # plt.axis("off")
+                # plt.title(f"OCR Results for {filename}")
+                # plt.show()
+                pass
             except Exception as e:
                 print(f"Warning: Could not display image {filename}")
 
@@ -1256,23 +1280,43 @@ def extract_serial_with_improved_ocr(results, full_path):
     # Find potential serials
     potential_serials = find_potential_serials(all_candidates)
 
-    # Remove duplicates and sort by confidence
-    unique_serials = {}
-    for serial_info in potential_serials:
-        serial = serial_info["serial"]
-        if (
-            serial not in unique_serials
-            or serial_info["confidence"] > unique_serials[serial]["confidence"]
-        ):
-            unique_serials[serial] = serial_info
+    # Confidence-weighted voting across identical serial strings
+    votes = {}
+    for s in potential_serials:
+        serial = s["serial"]
+        votes.setdefault(serial, {"sum_conf": 0.0, "sources": set(), "best": s})
+        votes[serial]["sum_conf"] += float(s["confidence"])
+        votes[serial]["sources"].add(s["source"])
+        # Track best example for display
+        if s["confidence"] > votes[serial]["best"]["confidence"]:
+            votes[serial]["best"] = s
 
-    # Sort by confidence
-    sorted_serials = sorted(
-        unique_serials.values(), key=lambda x: x["confidence"], reverse=True
-    )
+    # Build scored list: sum of confidences + small bonus for consensus across sources
+    scored = []
+    for serial, info in votes.items():
+        consensus_bonus = 0.05 * len(info["sources"])  # gentle, non-brittle bias
+        score = info["sum_conf"] + consensus_bonus
+        best = info["best"]
+        scored.append(
+            {
+                "serial": serial,
+                "original_text": best["original_text"],
+                "confidence": score,  # for ranking/printing
+                "source": ",".join(sorted(info["sources"]))[:120],
+                "bbox": best["bbox"],
+            }
+        )
+
+    # Sort by vote score
+    sorted_serials = sorted(scored, key=lambda x: x["confidence"], reverse=True)
 
     # Display top candidates for transparency
     print(f"\nSerial number candidates found:")
+    # Capture to global for downstream CSV
+    global SERIAL_CANDIDATES_LAST
+    SERIAL_CANDIDATES_LAST = [
+        (si["serial"], float(si["confidence"])) for si in sorted_serials[:5]
+    ]
     if sorted_serials:
         for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
             marker = "→ SELECTED" if i == 0 else "  "
@@ -1425,12 +1469,15 @@ for filename in file_list:
     if os.path.isdir(full_path):
         continue
 
+    # Total timer starts per file
+    _total_t0 = time.perf_counter()
     print(f"\nProcessing: {filename}")
 
     # Check if it's an image file (excluding BMP which is handled in another cell)
     if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         try:
             # Process non-BMP image formats with enhanced parameters
+            _ocr_t0 = time.perf_counter()
             results = reader.readtext(
                 full_path,
                 detail=1,
@@ -1440,6 +1487,9 @@ for filename in file_list:
                 link_threshold=0.4,
                 mag_ratio=1.5,
             )
+            ocr_time_sec = time.perf_counter() - _ocr_t0
+            # OCR-only timing (Cell 5)
+            log_ocr_time("cell5", "EasyOCR", "N/A", full_path, ocr_time_sec)
 
             # Place file in a DataFrame
             img_id = filename.split("/")[-1].split(".")[0]
@@ -1470,14 +1520,15 @@ for filename in file_list:
                         2,
                     )
 
-                # Display the image
+                # Display the image (disabled for performance)
                 try:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(img_rgb)
-                    plt.axis("off")
-                    plt.title(f"OCR Results for {filename}")
-                    plt.show()
+                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # plt.figure(figsize=(12, 8))
+                    # plt.imshow(img_rgb)
+                    # plt.axis("off")
+                    # plt.title(f"OCR Results for {filename}")
+                    # plt.show()
+                    pass
                 except Exception as e:
                     print(f"Warning: Could not display image {filename}")
 
@@ -1601,6 +1652,14 @@ for filename in file_list:
                 elif zipcode:
                     complete_address += f" {zipcode}"
 
+            # Build top-5 candidates string from global
+            try:
+                top_candidates = "; ".join(
+                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
+                )
+            except Exception:
+                top_candidates = ""
+
             # Create CSV record with standardized columns, using 'Missing' for empty values
             csv_record = {
                 "serial_number": str(serial_num) if serial_num else "Missing",
@@ -1613,6 +1672,14 @@ for filename in file_list:
                 "source_file": relative_path,
                 "file_created": metadata["file_creation_date"],
                 "file_modified": metadata["file_modification_date"],
+                # Instrumentation
+                "ocr_engine": "EasyOCR",
+                "ocr_device": "GPU",
+                "ocr_time_sec": (
+                    round(ocr_time_sec, 4) if "ocr_time_sec" in locals() else None
+                ),
+                "total_time_sec": round(time.perf_counter() - _total_t0, 4),
+                "top_serial_candidates": top_candidates,
             }
 
             csv_results.append(csv_record)
@@ -1960,6 +2027,11 @@ def extract_serial_with_improved_ocr(results, full_path):
 
     # Display top candidates for transparency
     print(f"\nSerial number candidates found:")
+    # Capture to global for downstream CSV
+    global SERIAL_CANDIDATES_LAST
+    SERIAL_CANDIDATES_LAST = [
+        (si["serial"], float(si["confidence"])) for si in sorted_serials[:5]
+    ]
     if sorted_serials:
         for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
             marker = "→ SELECTED" if i == 0 else "  "
@@ -2112,12 +2184,19 @@ for filename in file_list:
     if os.path.isdir(full_path):
         continue
 
+    # Total timer starts per file
+    _total_t0 = time.perf_counter()
     print(f"\nProcessing: {filename}")
 
     # Check if it's an image file (excluding BMP which is handled in another cell)
     if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         try:
-            # Process non-BMP image formats with enhanced parameters
+            # Identify OCR engine/device for logging
+            _ocr_engine = "EasyOCR"
+            _ocr_device = "GPU"  # reader created with gpu=True in this cell
+
+            # Process non-BMP image formats with enhanced parameters (time OCR)
+            _ocr_t0 = time.perf_counter()
             results = reader.readtext(
                 full_path,
                 detail=1,
@@ -2126,6 +2205,15 @@ for filename in file_list:
                 low_text=0.1,
                 link_threshold=0.4,
                 mag_ratio=1.5,
+            )
+            _ocr_time_sec = time.perf_counter() - _ocr_t0
+            # OCR-only timing (Cell 6 / EasyOCR GPU path)
+            log_ocr_time(
+                "cell6",
+                _ocr_engine if "_ocr_engine" in locals() else "EasyOCR",
+                _ocr_device if "_ocr_device" in locals() else "GPU",
+                full_path,
+                _ocr_time_sec,
             )
 
             # Place file in a DataFrame
@@ -2157,14 +2245,15 @@ for filename in file_list:
                         2,
                     )
 
-                # Display the image
+                # Display the image (disabled for performance)
                 try:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(img_rgb)
-                    plt.axis("off")
-                    plt.title(f"OCR Results for {filename}")
-                    plt.show()
+                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # plt.figure(figsize=(12, 8))
+                    # plt.imshow(img_rgb)
+                    # plt.axis("off")
+                    # plt.title(f"OCR Results for {filename}")
+                    # plt.show()
+                    pass
                 except Exception as e:
                     print(f"Warning: Could not display image {filename}")
 
@@ -2288,6 +2377,17 @@ for filename in file_list:
                 elif zipcode:
                     complete_address += f" {zipcode}"
 
+            # Build top-5 candidates string from global
+            try:
+                top_candidates = "; ".join(
+                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
+                )
+            except Exception:
+                top_candidates = ""
+
+            # Compute total time
+            _total_time_sec = time.perf_counter() - _total_t0
+
             # Create CSV record with standardized columns, using 'Missing' for empty values
             csv_record = {
                 "serial_number": str(serial_num) if serial_num else "Missing",
@@ -2300,6 +2400,12 @@ for filename in file_list:
                 "source_file": relative_path,
                 "file_created": metadata["file_creation_date"],
                 "file_modified": metadata["file_modification_date"],
+                # Instrumentation fields
+                "ocr_engine": _ocr_engine,
+                "ocr_device": _ocr_device,
+                "ocr_time_sec": round(_ocr_time_sec, 6),
+                "total_time_sec": round(_total_time_sec, 6),
+                "top_serial_candidates": top_candidates,
             }
 
             csv_results.append(csv_record)
@@ -2595,6 +2701,12 @@ def extract_serial(results, full_path):
             best[serial] = (serial, orig, sc, src)
     ordered = sorted(best.values(), key=lambda x: x[2], reverse=True)
     print("Serial number candidates:")
+    # capture to global for CSV sidecar
+    try:
+        global SERIAL_CANDIDATES_LAST
+        SERIAL_CANDIDATES_LAST = [(s, float(sc)) for (s, orig, sc, src) in ordered[:5]]
+    except Exception:
+        pass
     for i, (s, orig, sc, src) in enumerate(ordered[:5]):
         mark = "→ SELECTED" if i == 0 else "  "
         print(f"  {mark} '{s}' (score {sc:.3f}) from {src} | raw: '{orig}'")
@@ -2622,7 +2734,9 @@ for filename in file_list:
     if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         continue
     print(f"\nProcessing: {filename}")
+    _total_t0 = time.perf_counter()
     try:
+        _ocr_t0 = time.perf_counter()
         results = readtext_stable(
             full_path,
             detail=1,
@@ -2632,6 +2746,10 @@ for filename in file_list:
             link_threshold=0.4,
             mag_ratio=1.5,
         )
+        ocr_time_sec = time.perf_counter() - _ocr_t0
+        # OCR-only timing (Cell 8 / EasyOCR MPS fallback)
+        _device = "MPS" if ("_mps_active" in locals() and _mps_active) else "CPU"
+        log_ocr_time("cell8", "EasyOCR", _device, full_path, ocr_time_sec)
         print("\n--- OCR-Focused Serial Number Detection ---")
         serial_num = extract_serial(results, full_path)
         print("--- End OCR-Focused Serial Number Detection ---")
@@ -2697,6 +2815,14 @@ for filename in file_list:
         metadata = get_file_metadata(full_path)
         relative_path = os.path.join("test", filename)
 
+        # Build top-5 candidates string from global
+        try:
+            top_candidates = "; ".join(
+                [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
+            )
+        except Exception:
+            top_candidates = ""
+
         csv_results.append(
             {
                 "serial_number": serial_num or "Missing",
@@ -2707,6 +2833,14 @@ for filename in file_list:
                 "source_file": relative_path,
                 "file_created": metadata["file_creation_date"],
                 "file_modified": metadata["file_modification_date"],
+                # Instrumentation
+                "ocr_engine": "EasyOCR",
+                "ocr_device": "MPS" if _mps_active else "CPU",
+                "ocr_time_sec": (
+                    round(ocr_time_sec, 4) if "ocr_time_sec" in locals() else None
+                ),
+                "total_time_sec": round(time.perf_counter() - _total_t0, 4),
+                "top_serial_candidates": top_candidates,
             }
         )
 
@@ -3532,6 +3666,11 @@ def extract_serial_with_improved_ocr(results, full_path):
 
     # Display top candidates for transparency
     print(f"\nSerial number candidates found:")
+    # Capture to global for downstream CSV
+    global SERIAL_CANDIDATES_LAST
+    SERIAL_CANDIDATES_LAST = [
+        (si["serial"], float(si["confidence"])) for si in sorted_serials[:5]
+    ]
     if sorted_serials:
         for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
             marker = "→ SELECTED" if i == 0 else "  "
@@ -3689,7 +3828,12 @@ for filename in file_list:
     # Check if it's an image file (excluding BMP which is handled in another cell)
     if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         try:
+            # Identify OCR engine/device for logging
+            _ocr_engine = "EasyOCR"
+            _ocr_device = "MPS" if mps_available else "CPU"
+
             # OCR with device fallback (handles MPS -> CPU automatically on error)
+            _ocr_t0 = time.perf_counter()
             results = readtext_with_fallback(
                 reader,
                 full_path,
@@ -3700,6 +3844,7 @@ for filename in file_list:
                 link_threshold=0.4,
                 mag_ratio=1.5,
             )
+            _ocr_time_sec = time.perf_counter() - _ocr_t0
 
             # Place file in a DataFrame (kept for consistency/debugging)
             img_id = filename.split("/")[-1].split(".")[0]
@@ -3730,14 +3875,15 @@ for filename in file_list:
                         2,
                     )
 
-                # Display the image
+                # Display the image (disabled for performance)
                 try:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(img_rgb)
-                    plt.axis("off")
-                    plt.title(f"OCR Results for {filename}")
-                    plt.show()
+                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # plt.figure(figsize=(12, 8))
+                    # plt.imshow(img_rgb)
+                    # plt.axis("off")
+                    # plt.title(f"OCR Results for {filename}")
+                    # plt.show()
+                    pass
                 except Exception as e:
                     print(f"Warning: Could not display image {filename}")
 
@@ -3861,6 +4007,17 @@ for filename in file_list:
                 elif zipcode:
                     complete_address += f" {zipcode}"
 
+            # Build top-5 candidates string from global
+            try:
+                top_candidates = "; ".join(
+                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
+                )
+            except Exception:
+                top_candidates = ""
+
+            # Compute total time
+            _total_time_sec = time.perf_counter() - _total_t0
+
             # Create CSV record with standardized columns, using 'Missing' for empty values
             csv_record = {
                 "serial_number": str(serial_num) if serial_num else "Missing",
@@ -3873,6 +4030,12 @@ for filename in file_list:
                 "source_file": relative_path,
                 "file_created": metadata["file_creation_date"],
                 "file_modified": metadata["file_modification_date"],
+                # Instrumentation fields
+                "ocr_engine": _ocr_engine,
+                "ocr_device": _ocr_device,
+                "ocr_time_sec": round(_ocr_time_sec, 6),
+                "total_time_sec": round(_total_time_sec, 6),
+                "top_serial_candidates": top_candidates,
             }
 
             csv_results.append(csv_record)
@@ -4085,6 +4248,16 @@ def extract_serial_with_improved_ocr(paddle_like_results, full_path):
         sharpened = cv2.filter2D(gray, -1, kernel)
         preprocessed_images.append(("sharpened", sharpened))
 
+        # Fast denoising (non-local means)
+        try:
+            denoised = cv2.fastNlMeansDenoising(
+                gray, None, h=10, templateWindowSize=7, searchWindowSize=21
+            )
+            preprocessed_images.append(("denoised", denoised))
+        except Exception:
+            # If OpenCV build lacks this, skip gracefully
+            pass
+
         # Adaptive threshold
         adaptive = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
@@ -4102,42 +4275,78 @@ def extract_serial_with_improved_ocr(paddle_like_results, full_path):
         """Run OCR with different parameters and preprocessing using PaddleOCR"""
         all_candidates = []
 
-        # Standard OCR (on original)
-        base_raw = paddle_readtext_cpu(image_path, cls=True)
-        base = normalize_paddle_results(base_raw)
-        for bbox, text, confidence in base:
-            if text.strip() and confidence > 0.3:
-                all_candidates.append(
-                    {
-                        "text": text.strip(),
-                        "confidence": confidence,
-                        "source": "standard_ocr",
-                        "bbox": bbox,
-                    }
+        import cv2
+        import numpy as np
+
+        # Helper: rotate an image (np.ndarray) by angle around center
+        def rotate_ndarray(img_nd, angle):
+            try:
+                (h, w) = img_nd.shape[:2]
+                center = (w / 2, h / 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(
+                    img_nd,
+                    M,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REPLICATE,
                 )
+                return rotated
+            except Exception:
+                return img_nd
+
+        # Standard OCR (on original) with rotations
+        for angle in (0, 90, 180, 270):
+            try:
+                if angle == 0:
+                    base_raw = paddle_readtext_cpu(image_path, cls=True)
+                else:
+                    # Read and rotate original BGR image
+                    bgr = cv2.imread(image_path)
+                    if bgr is None:
+                        continue
+                    rotated_bgr = rotate_ndarray(bgr, angle)
+                    base_raw = paddle_readtext_cpu(rotated_bgr, cls=True)
+                base = normalize_paddle_results(base_raw)
+                for bbox, text, confidence in base:
+                    if text.strip() and confidence > 0.3:
+                        all_candidates.append(
+                            {
+                                "text": text.strip(),
+                                "confidence": confidence,
+                                "source": f"standard_ocr_rot{angle}",
+                                "bbox": bbox,
+                            }
+                        )
+            except Exception as e:
+                print(f"Error during standard OCR rotation {angle}: {e}")
 
         # Try different preprocessing
         preprocessed_images = preprocess_image_for_ocr(image_path)
         if preprocessed_images:
             for prep_name, prep_img in preprocessed_images:
                 try:
-                    # PaddleOCR accepts np.ndarray as input
-                    prep_raw = paddle_readtext_cpu(prep_img, cls=True)
-                    prep_results = normalize_paddle_results(prep_raw)
+                    # PaddleOCR accepts np.ndarray as input; include rotations
+                    for angle in (0, 90, 180, 270):
+                        rotated = (
+                            rotate_ndarray(prep_img, angle) if angle != 0 else prep_img
+                        )
+                        prep_raw = paddle_readtext_cpu(rotated, cls=True)
+                        prep_results = normalize_paddle_results(prep_raw)
 
-                    for bbox, text, confidence in prep_results:
-                        if (
-                            text.strip() and confidence > 0.2
-                        ):  # Lower threshold for preprocessed
-                            all_candidates.append(
-                                {
-                                    "text": text.strip(),
-                                    "confidence": confidence
-                                    * 0.9,  # Slight penalty for preprocessed
-                                    "source": f"preprocessed_{prep_name}",
-                                    "bbox": bbox,
-                                }
-                            )
+                        for bbox, text, confidence in prep_results:
+                            if (
+                                text.strip() and confidence > 0.2
+                            ):  # Lower threshold for preprocessed
+                                all_candidates.append(
+                                    {
+                                        "text": text.strip(),
+                                        "confidence": confidence
+                                        * 0.9,  # Slight penalty for preprocessed
+                                        "source": f"preprocessed_{prep_name}_rot{angle}",
+                                        "bbox": bbox,
+                                    }
+                                )
                 except Exception as e:
                     print(f"Error with {prep_name} preprocessing: {e}")
 
@@ -4444,8 +4653,21 @@ for filename in file_list:
     # Check if it's an image file (excluding BMP which is handled in another cell)
     if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         try:
+            # Identify OCR engine/device and time the OCR call
+            _ocr_engine = "PaddleOCR"
+            _ocr_device = "CPU"
+            _ocr_t0 = time.perf_counter()
             # PaddleOCR (CPU-only)
             paddle_raw = paddle_readtext_cpu(full_path, cls=True)
+            _ocr_time_sec = time.perf_counter() - _ocr_t0
+            # OCR-only timing (Cell 10 / Paddle CPU)
+            log_ocr_time(
+                "cell10",
+                _ocr_engine if "_ocr_engine" in locals() else "PaddleOCR",
+                _ocr_device if "_ocr_device" in locals() else "CPU",
+                full_path,
+                _ocr_time_sec,
+            )
             results = normalize_paddle_results(
                 paddle_raw
             )  # [(bbox, text, confidence), ...]
@@ -4483,14 +4705,15 @@ for filename in file_list:
                         # be resilient to unexpected bbox formats
                         pass
 
-                # Display the image
+                # Display the image (disabled for performance)
                 try:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(img_rgb)
-                    plt.axis("off")
-                    plt.title(f"OCR Results for {filename}")
-                    plt.show()
+                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # plt.figure(figsize=(12, 8))
+                    # plt.imshow(img_rgb)
+                    # plt.axis("off")
+                    # plt.title(f"OCR Results for {filename}")
+                    # plt.show()
+                    pass
                 except Exception:
                     print(f"Warning: Could not display image {filename}")
 
@@ -4620,6 +4843,17 @@ for filename in file_list:
                 elif zipcode:
                     complete_address += f" {zipcode}"
 
+            # Build top-5 candidates string from global
+            try:
+                top_candidates = "; ".join(
+                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
+                )
+            except Exception:
+                top_candidates = ""
+
+            # Compute total time
+            _total_time_sec = time.perf_counter() - _total_t0
+
             # Create CSV record with standardized columns, using 'Missing' for empty values
             csv_record = {
                 "serial_number": str(serial_num) if serial_num else "Missing",
@@ -4632,6 +4866,12 @@ for filename in file_list:
                 "source_file": relative_path,
                 "file_created": metadata["file_creation_date"],
                 "file_modified": metadata["file_modification_date"],
+                # Instrumentation fields
+                "ocr_engine": _ocr_engine,
+                "ocr_device": _ocr_device,
+                "ocr_time_sec": round(_ocr_time_sec, 6),
+                "total_time_sec": round(_total_time_sec, 6),
+                "top_serial_candidates": top_candidates,
             }
 
             csv_results.append(csv_record)
@@ -5210,8 +5450,13 @@ for filename in file_list:
     # Check if it's an image file (excluding BMP which is handled in another cell)
     if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         try:
+            # Identify OCR engine/device and time the OCR call
+            _ocr_engine = "PaddleOCR"
+            _ocr_device = "CPU"
+            _ocr_t0 = time.perf_counter()
             # PaddleOCR (CPU-only)
             paddle_raw = paddle_readtext_cpu(full_path, cls=True)
+            _ocr_time_sec = time.perf_counter() - _ocr_t0
             results = normalize_paddle_results(
                 paddle_raw
             )  # [(bbox, text, confidence), ...]
@@ -5249,14 +5494,15 @@ for filename in file_list:
                         # be resilient to unexpected bbox formats
                         pass
 
-                # Display the image
+                # Display the image (disabled for performance)
                 try:
-                    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    plt.figure(figsize=(12, 8))
-                    plt.imshow(img_rgb)
-                    plt.axis("off")
-                    plt.title(f"OCR Results for {filename}")
-                    plt.show()
+                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # plt.figure(figsize=(12, 8))
+                    # plt.imshow(img_rgb)
+                    # plt.axis("off")
+                    # plt.title(f"OCR Results for {filename}")
+                    # plt.show()
+                    pass
                 except Exception:
                     print(f"Warning: Could not display image {filename}")
 
@@ -5386,6 +5632,17 @@ for filename in file_list:
                 elif zipcode:
                     complete_address += f" {zipcode}"
 
+            # Build top-5 candidates string from global
+            try:
+                top_serial_candidates = "; ".join(
+                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
+                )
+            except Exception:
+                top_serial_candidates = ""
+
+            # Compute total time
+            _total_time_sec = time.perf_counter() - _total_t0
+
             # Create CSV record with standardized columns, using 'Missing' for empty values
             csv_record = {
                 "serial_number": str(serial_num) if serial_num else "Missing",
@@ -5398,6 +5655,12 @@ for filename in file_list:
                 "source_file": relative_path,
                 "file_created": metadata["file_creation_date"],
                 "file_modified": metadata["file_modification_date"],
+                # Instrumentation fields
+                "ocr_engine": _ocr_engine,
+                "ocr_device": _ocr_device,
+                "ocr_time_sec": round(_ocr_time_sec, 6),
+                "total_time_sec": round(_total_time_sec, 6),
+                "top_serial_candidates": top_serial_candidates,
             }
 
             csv_results.append(csv_record)
@@ -5485,7 +5748,7 @@ else:
 
 
 # %%
-# CELL 11: Build Full Image Extraction Report with All Available Fields
+# CELL 12: Build Full Image Extraction Report with All Available Fields
 
 import os
 import pandas as pd
@@ -5757,4 +6020,3 @@ print("Columns order:")
 print(final_cols)
 
 display(report_df.head(10))
-
