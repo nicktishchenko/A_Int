@@ -12,7 +12,7 @@
 #     name: python3
 # ---
 
-# %% cellUniqueIdByVincent="cce53"
+# %%
 # CELL 1: Import Libraries and Environment Setup with Unified Schema & Visualization Support
 import os
 import re
@@ -27,6 +27,8 @@ import easyocr
 import zipcodes
 import time
 import csv
+import contextlib
+import io
 
 plt.style.use("ggplot")
 
@@ -43,12 +45,29 @@ EXPECTED_COLUMNS = [
 ]
 _reader_instance = None
 
+# Quiet mode for OCR library noise
+QUIET_OCR_LOGS = True
+
+
+def ocr_log(msg: str):
+    if not QUIET_OCR_LOGS:
+        print(msg)
+
+
+# Serial extraction configuration (env-overridable)
+# Change via environment variables without code edits:
+#   export SERIAL_MIN_LEN=5 SERIAL_MAX_LEN=12
+SERIAL_MIN_LEN = int(os.getenv("SERIAL_MIN_LEN", "5"))
+SERIAL_MAX_LEN = int(os.getenv("SERIAL_MAX_LEN", "12"))
+
 
 def get_easyocr_reader(langs=("en",)):
     global _reader_instance
     if _reader_instance is None:
         try:
-            _reader_instance = easyocr.Reader(list(langs))
+            _tmp = io.StringIO()
+            with contextlib.redirect_stdout(_tmp), contextlib.redirect_stderr(_tmp):
+                _reader_instance = easyocr.Reader(list(langs))
         except Exception as e:
             print(f"EasyOCR initialization failed: {e}")
             _reader_instance = None
@@ -316,6 +335,7 @@ import os
 import cv2
 import numpy as np
 import easyocr
+import torch
 import matplotlib.pyplot as plt
 import pandas as pd
 import re
@@ -328,13 +348,78 @@ df1["file_modification_date"] = df1["file_modification_date"].astype(str)
 df1["file_location"] = df1["file_location"].astype(str)
 
 test_folder = os.path.join(os.getcwd(), "test")
-reader = easyocr.Reader(["en"], gpu=True)
 file_list = [f for f in os.listdir(test_folder) if f.lower().endswith(".bmp")]
 
 print(f"Found {len(file_list)} BMP files in test folder")
 
 # Initialize results list for CSV output
 csv_results = []
+
+# Ensure device-aware OCR wrapper exists even if earlier cells haven't run yet
+if "readtext_stable" not in globals():
+    _bmp_reader = None
+    _bmp_mps_active = False
+    _bmp_mps_fail_notified = False
+
+    def _init_easyocr_bmp():
+        global _bmp_mps_active
+        try:
+            if torch.cuda.is_available():
+                ocr_log("Initializing EasyOCR for BMP on CUDA…")
+                _tmp_cuda = io.StringIO()
+                with contextlib.redirect_stdout(_tmp_cuda), contextlib.redirect_stderr(
+                    _tmp_cuda
+                ):
+                    return easyocr.Reader(["en"], gpu=True)
+        except Exception:
+            pass
+
+        try:
+            if torch.backends.mps.is_available():
+                ocr_log("Initializing EasyOCR for BMP on Apple MPS (experimental)…")
+                _tmp = io.StringIO()
+                with contextlib.redirect_stdout(_tmp), contextlib.redirect_stderr(_tmp):
+                    rdr = easyocr.Reader(["en"], gpu=False)
+                try:
+                    mps = torch.device("mps")
+                    for attr in ("detector", "recognizer", "model"):
+                        mdl = getattr(rdr, attr, None)
+                        if mdl and hasattr(mdl, "to"):
+                            mdl.to(mps)
+                    _bmp_mps_active = True
+                except Exception as e:
+                    ocr_log(f"MPS move failed for BMP: {e}. Using CPU.")
+                    _bmp_mps_active = False
+                return rdr
+        except Exception:
+            pass
+
+        ocr_log("Using CPU for BMP (no CUDA/MPS available).")
+        _tmp2 = io.StringIO()
+        with contextlib.redirect_stdout(_tmp2), contextlib.redirect_stderr(_tmp2):
+            return easyocr.Reader(["en"], gpu=False)
+
+    _bmp_reader = _init_easyocr_bmp()
+
+    def readtext_stable(image_or_path, **kwargs):
+        global _bmp_reader, _bmp_mps_active, _bmp_mps_fail_notified
+        try:
+            return _bmp_reader.readtext(image_or_path, **kwargs)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if _bmp_mps_active and (
+                "mps" in msg or "same device" in msg or "slow_conv2d" in msg
+            ):
+                if not _bmp_mps_fail_notified:
+                    ocr_log(
+                        "MPS runtime issue in BMP cell -> switching to CPU for remainder."
+                    )
+                _bmp_reader = easyocr.Reader(["en"], gpu=False)
+                _bmp_mps_active = False
+                _tmp = io.StringIO()
+                with contextlib.redirect_stdout(_tmp), contextlib.redirect_stderr(_tmp):
+                    return _bmp_reader.readtext(image_or_path, **kwargs)
+            raise
 
 
 def combine_spaced_alphanumeric(text):
@@ -348,57 +433,78 @@ def combine_spaced_alphanumeric(text):
         ]
         if len(single_chars) >= 2:
             combined = "".join(parts)
-            if 5 <= len(combined) <= 20 and combined.isalnum():
+            if SERIAL_MIN_LEN <= len(combined) <= SERIAL_MAX_LEN and combined.isalnum():
                 return combined
     return text
 
 
 def find_serial(processed_results, all_text_combined, original_results):
-    """Find serial number using multiple strategies"""
-    patterns = [
-        r"\b[A-Z0-9]{7,12}\b",
-        r"\b[A-Z0-9]{4,20}\b",
-        r"\b[A-Z]{1,2}[0-9]{4,10}\b",
-        r"\b[0-9]{4,15}\b",
-        r"\b[A-Z]{2,10}[0-9]{2,10}\b",
-        r"\b[A-Z]{3,15}\b",
-        r"\b[0-9]{5,15}\b",
-    ]
+    """Find serial using a generic alphanumeric pattern and score candidates.
 
-    # Try processed results first
-    for pattern in patterns:
-        for bbox, text, confidence in processed_results:
-            match = re.search(pattern, text)
-            if match:
-                candidate = match.group()
-                if (
-                    5 <= len(candidate) <= 20
-                    and candidate.lower()
-                    not in ["image", "photo", "document", "serial", "number"]
-                    and candidate.isalnum()
-                ):
-                    return candidate
+    Preference: mixed alphanumeric > letters-only > digits-only, with OCR confidence and length as tie-breakers.
+    No hardcoded letter/digit order; fully driven by SERIAL_MIN_LEN/MAX_LEN.
+    """
+    min_len, max_len = SERIAL_MIN_LEN, SERIAL_MAX_LEN
+    alnum_pattern = re.compile(rf"\b[A-Z0-9]{{{min_len},{max_len}}}\b")
 
-    # Try combined text
+    def composition_score(s: str) -> int:
+        has_alpha = any(c.isalpha() for c in s)
+        has_digit = any(c.isdigit() for c in s)
+        if has_alpha and has_digit:
+            return 2
+        if has_alpha:
+            return 1
+        return 0  # digits-only
+
+    candidates = []  # (serial, score, confidence, length)
+
+    # 1) From processed tokenized results (with per-token confidence)
+    for bbox, text, confidence in processed_results:
+        for m in alnum_pattern.finditer(text.upper()):
+            cand = m.group(0)
+            if min_len <= len(cand) <= max_len and cand.isalnum():
+                candidates.append(
+                    (cand, composition_score(cand), float(confidence), len(cand))
+                )
+
+    # 2) From combined text (assign a modest default confidence)
     if all_text_combined:
-        for pattern in patterns:
-            match = re.search(pattern, all_text_combined)
-            if match:
-                candidate = match.group()
-                if 5 <= len(candidate) <= 20 and candidate.isalnum():
-                    return candidate
+        for m in alnum_pattern.finditer(all_text_combined.upper()):
+            cand = m.group(0)
+            if min_len <= len(cand) <= max_len and cand.isalnum():
+                candidates.append((cand, composition_score(cand), 0.5, len(cand)))
 
-    # Try spaced reconstruction
+    # 3) Spaced reconstruction fallback from original OCR results
     for bbox, text, confidence in original_results:
         if " " in text and len(text.split()) >= 3:
             parts = text.split()
             single_chars = [p for p in parts if len(p) == 1]
             if len(single_chars) >= 3:
-                reconstructed = "".join(parts)
-                if 5 <= len(reconstructed) <= 20 and reconstructed.isalnum():
-                    return reconstructed
+                reconstructed = "".join(parts).upper()
+                if min_len <= len(reconstructed) <= max_len and reconstructed.isalnum():
+                    candidates.append(
+                        (
+                            reconstructed,
+                            composition_score(reconstructed),
+                            float(confidence) * 0.8,
+                            len(reconstructed),
+                        )
+                    )
 
-    return None
+    if not candidates:
+        return None
+
+    # Aggregate by serial: keep best confidence for each and then rank
+    best_by_serial = {}
+    for serial, comp, conf, ln in candidates:
+        prev = best_by_serial.get(serial)
+        if not prev or conf > prev[2]:
+            best_by_serial[serial] = (serial, comp, conf, ln)
+
+    ranked = sorted(
+        best_by_serial.values(), key=lambda x: (x[1], x[2], x[3]), reverse=True
+    )
+    return ranked[0][0] if ranked else None
 
 
 def extract_metadata(processed_results):
@@ -836,11 +942,16 @@ for filename in file_list:
     # print(f"\nProcessing BMP: {filename}")
 
     try:
-        # Load BMP with OpenCV and convert for EasyOCR
+        # Load BMP with OpenCV and convert for OCR
         img_cv = cv2.imread(full_path)
         if img_cv is not None and isinstance(img_cv, np.ndarray):
             img_for_ocr = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-            results = reader.readtext(img_for_ocr)
+            # Use the shared, device-aware OCR wrapper from earlier cells
+            results = readtext_stable(
+                img_for_ocr,
+                detail=1,
+                paragraph=False,
+            )
         else:
             print(f"Failed to load BMP file {filename}")
             results = []
@@ -850,10 +961,22 @@ for filename in file_list:
         if img is not None and isinstance(img, np.ndarray):
             for bbox, text, confidence in results:
                 pts = np.array(bbox, np.int32).reshape((-1, 1, 2))
-                cv2.polylines(img, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
+                cv2.polylines(
+                    img,
+                    [pts],
+                    isClosed=True,
+                    color=(0, 0, 255),
+                    thickness=2,
+                )
                 x, y = pts[0][0]
                 cv2.putText(
-                    img, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+                    img,
+                    text,
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    2,
                 )
 
             try:
@@ -988,7 +1111,7 @@ else:
     print("\nNo results to display.")
 
 
-# %% cellUniqueIdByVincent="798b8"
+# %%
 # CELL 4: Diagnostic code - add this to a cell and run it on one of your BMP files
 import os
 from datetime import datetime
@@ -1037,7 +1160,7 @@ debug_timestamps("test/3310 BAHR353.bmp")  # Replace with actual file path
 
 
 # %%
-# CELL 5.0: Process non BMP image files with OCR-focused serial extraction and CSV output
+# CELL 5: Process non BMP image files with OCR-focused serial extraction and CSV output
 # Add metadata columns to df1
 df1["filename"] = df1["filename"].astype(str)
 df1["file_creation_date"] = df1["file_creation_date"].astype(str)
@@ -1085,10 +1208,7 @@ def extract_serial_with_improved_ocr(results, full_path):
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
         preprocessed_images.append(("blurred", blurred))
 
-        # Sharpen
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(gray, -1, kernel)
-        preprocessed_images.append(("sharpened", sharpened))
+        # Note: Removed aggressive sharpening pass (tended to drop thin strokes like 'F')
 
         # Adaptive threshold
         adaptive = cv2.adaptiveThreshold(
@@ -1124,16 +1244,20 @@ def extract_serial_with_improved_ocr(results, full_path):
         if preprocessed_images:
             for prep_name, prep_img in preprocessed_images:
                 try:
-                    # Run OCR on preprocessed image
-                    prep_results = reader.readtext(
-                        prep_img,
-                        detail=1,
-                        paragraph=False,
-                        text_threshold=0.1,  # Lower threshold
-                        low_text=0.05,
-                        link_threshold=0.3,
-                        mag_ratio=2.0,  # Higher magnification
-                    )
+                    # Run OCR on preprocessed image (suppress noisy stdout/stderr)
+                    _tmp_cuda = io.StringIO()
+                    with contextlib.redirect_stdout(
+                        _tmp_cuda
+                    ), contextlib.redirect_stderr(_tmp_cuda):
+                        prep_results = reader.readtext(
+                            prep_img,
+                            detail=1,
+                            paragraph=False,
+                            text_threshold=0.1,
+                            low_text=0.2,  # preserve faint strokes
+                            link_threshold=0.3,
+                            mag_ratio=2.0,  # Higher magnification
+                        )
 
                     for bbox, text, confidence in prep_results:
                         if (
@@ -1291,24 +1415,30 @@ def extract_serial_with_improved_ocr(results, full_path):
         if s["confidence"] > votes[serial]["best"]["confidence"]:
             votes[serial]["best"] = s
 
-    # Build scored list: sum of confidences + small bonus for consensus across sources
+    # Build scored list without heuristics: rank by summed OCR confidence only.
+    # Tie-break by max single-source confidence, then preserve first-seen order.
     scored = []
+    order_index = {k: i for i, k in enumerate(votes.keys())}
     for serial, info in votes.items():
-        consensus_bonus = 0.05 * len(info["sources"])  # gentle, non-brittle bias
-        score = info["sum_conf"] + consensus_bonus
+        score = info["sum_conf"]
         best = info["best"]
         scored.append(
             {
                 "serial": serial,
                 "original_text": best["original_text"],
-                "confidence": score,  # for ranking/printing
+                "confidence": score,
+                "max_conf": best["confidence"],
+                "order": order_index[serial],
                 "source": ",".join(sorted(info["sources"]))[:120],
                 "bbox": best["bbox"],
             }
         )
 
-    # Sort by vote score
-    sorted_serials = sorted(scored, key=lambda x: x["confidence"], reverse=True)
+    sorted_serials = sorted(
+        scored,
+        key=lambda x: (x["confidence"], x["max_conf"], -x["order"]),
+        reverse=True,
+    )
 
     # Display top candidates for transparency
     print(f"\nSerial number candidates found:")
@@ -1478,15 +1608,19 @@ for filename in file_list:
         try:
             # Process non-BMP image formats with enhanced parameters
             _ocr_t0 = time.perf_counter()
-            results = reader.readtext(
-                full_path,
-                detail=1,
-                paragraph=False,
-                text_threshold=0.2,
-                low_text=0.1,
-                link_threshold=0.4,
-                mag_ratio=1.5,
-            )
+            _tmp_out = io.StringIO()
+            with contextlib.redirect_stdout(_tmp_out), contextlib.redirect_stderr(
+                _tmp_out
+            ):
+                results = reader.readtext(
+                    full_path,
+                    detail=1,
+                    paragraph=False,
+                    text_threshold=0.2,
+                    low_text=0.1,
+                    link_threshold=0.4,
+                    mag_ratio=1.5,
+                )
             ocr_time_sec = time.perf_counter() - _ocr_t0
             # OCR-only timing (Cell 5)
             log_ocr_time("cell5", "EasyOCR", "N/A", full_path, ocr_time_sec)
@@ -1616,7 +1750,7 @@ for filename in file_list:
 
                         # Check if in target region
                         if top_boundary <= text_center_y <= bottom_boundary:
-                            candidates.append((text, confidence, text_center_y))
+                            candidates.append((text, confidence))
 
                 if candidates:
                     # Return the candidate with highest confidence
@@ -1627,10 +1761,10 @@ for filename in file_list:
             # Get city and state information from zipcode
             if zipcode:
                 try:
-                    end = zipcodes.matching(str(zipcode))
-                    if end:
-                        city = end[0]["city"]
-                        state = end[0]["state"]
+                    location = zipcodes.matching(str(zipcode))
+                    if location:
+                        city = location[0]["city"]
+                        state = location[0]["state"]
                         matches += 2
                 except Exception as e:
                     print(f"Error looking up zipcode {zipcode}: {e}")
@@ -1640,6 +1774,13 @@ for filename in file_list:
 
             # Create relative path for source_file
             relative_path = os.path.join("test", filename)
+            # Log OCR-only timing for this cell/file
+            try:
+                log_ocr_time(
+                    "cell6", _ocr_engine, _ocr_device, relative_path, _ocr_time_sec
+                )
+            except Exception as _log_e:
+                print(f"Warning: failed to log OCR time for {relative_path}: {_log_e}")
 
             # Construct complete address
             complete_address = ""
@@ -1739,54 +1880,108 @@ for filename in file_list:
         print(f"BMP file (handled in separate cell): {filename}")
 
     elif filename.lower().endswith(".pdf"):
-        print(f"PDF file (would need special handling): {filename}")
-
+        ocr_log(f"PDF file (would need special handling): {filename}")
     else:
         print(f"Skipping non-image file: {filename}")
 
-print(f"\nProcessing complete!")
-
-# Create and save CSV results to reports folder
-if csv_results:
-    results_df = pd.DataFrame(csv_results)
-    print("\n" + "=" * 80)
-    print("NON-BMP IMAGE EXTRACTION RESULTS (CSV FORMAT)")
-    print("=" * 80)
-    print(results_df.to_csv(index=False))
-
-    # Create reports folder if it doesn't exist
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-
-    # Save to file in reports folder
-    output_file = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    results_df.to_csv(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
-else:
-    print("\nNo results to save.")
+print("\nProcessing complete!")
 
 
-# %% cellUniqueIdByVincent="a7164"
-# CELL 6: Process non BMP image files with OCR-focused serial extraction and CSV output
-# Add metadata columns to df1
-df1["filename"] = df1["filename"].astype(str)
-df1["file_creation_date"] = df1["file_creation_date"].astype(str)
-df1["file_modification_date"] = df1["file_modification_date"].astype(str)
-df1["file_location"] = df1["file_location"].astype(str)
+# %%
+# CELL 6: PaddleOCR pipeline (optional, disabled unless USE_PADDLE=1)
+import os as _os
+import re as _re
+from typing import List as _List, Tuple as _Tuple
 
-# Path to 'test' folder
-test_folder = os.path.join(os.getcwd(), "test")
+try:
+    from paddleocr import PaddleOCR as _PaddleOCR  # type: ignore
+except Exception:
+    _PaddleOCR = None
 
-# Initialize EasyOCR
-reader = easyocr.Reader(["en"], gpu=True)
+_USE_PADDLE = _os.getenv("USE_PADDLE", "0") == "1"
 
-# Get all files in 'test' folder
-file_list = os.listdir(test_folder)
 
-# Initialize CSV results list
-csv_results = []
+def _init_paddle_ocr():
+    """Initialize PaddleOCR quietly on CPU by default."""
+    if _PaddleOCR is None:
+        raise RuntimeError(
+            "PaddleOCR not available. Install 'paddleocr' to enable this cell."
+        )
+    return _PaddleOCR(use_angle_cls=True, show_log=False, use_gpu=False, lang="en")
 
-print(f"Found {len(file_list)} files in test folder")
+
+def _paddle_to_processed(paddle_res) -> _List[_Tuple[list, str, float]]:
+    processed = []
+    if not paddle_res:
+        return processed
+    items = paddle_res[0] if len(paddle_res) > 0 else []
+    for it in items:
+        try:
+            bbox, (text, conf) = it[0], it[1]
+            if text and isinstance(conf, (float, int)):
+                processed.append((bbox, str(text), float(conf)))
+        except Exception:
+            continue
+    return processed
+
+
+def _paddle_extract_serial(processed) -> str | None:
+    min_len, max_len = SERIAL_MIN_LEN, SERIAL_MAX_LEN
+    pat = _re.compile(rf"\b[A-Z0-9]{{{min_len},{max_len}}}\b")
+
+    best = None  # (serial, max_conf)
+    for _bbox, text, conf in processed:
+        upper = text.upper()
+        for m in pat.finditer(upper):
+            s = m.group(0)
+            if best is None or conf > best[1]:
+                best = (s, float(conf))
+    if best is None:
+        combined = " ".join(t for _b, t, _c in processed).upper()
+        for m in pat.finditer(combined):
+            best = (m.group(0), 0.5)
+            break
+    return best[0] if best else None
+
+
+def paddle_process_non_bmp(test_dir: str = "test"):
+    """Run PaddleOCR on non-BMP images and print serial summaries.
+    Enable with USE_PADDLE=1. This function does not write CSVs.
+    """
+    if not _USE_PADDLE:
+        print("PaddleOCR pipeline disabled. Set USE_PADDLE=1 to enable.")
+        return
+    try:
+        ocr = _init_paddle_ocr()
+    except Exception as e:
+        print(f"PaddleOCR init failed: {e}")
+        return
+
+    if not _os.path.isdir(test_dir):
+        print(f"Test directory not found: {test_dir}")
+        return
+
+    exts = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".gif")
+    files = [f for f in _os.listdir(test_dir) if f.lower().endswith(exts)]
+    print(f"PaddleOCR: Found {len(files)} non-BMP images in {test_dir}")
+
+    for fname in files:
+        path = _os.path.join(test_dir, fname)
+        try:
+            res = ocr.ocr(path, cls=True)
+            processed = _paddle_to_processed(res)
+            serial = _paddle_extract_serial(processed)
+            print(f"\n[PaddleOCR] {fname}")
+            print(f"  Serial: {serial if serial else 'None'}")
+        except Exception as e:
+            print(f"[PaddleOCR] Failed {fname}: {e}")
+
+
+# To use in notebook: set USE_PADDLE=1 then run: paddle_process_non_bmp('test')
+
+
+# %%
+# CELL 5: Non-BMP processing with EasyOCR, Apple Silicon (MPS) and Windows (CUDA) support
 
 
 def extract_serial_with_improved_ocr(results, full_path):
@@ -2027,22 +2222,21 @@ def extract_serial_with_improved_ocr(results, full_path):
 
     # Display top candidates for transparency
     print(f"\nSerial number candidates found:")
-    # Capture to global for downstream CSV
-    global SERIAL_CANDIDATES_LAST
-    SERIAL_CANDIDATES_LAST = [
-        (si["serial"], float(si["confidence"])) for si in sorted_serials[:5]
-    ]
-    if sorted_serials:
-        for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
-            marker = "→ SELECTED" if i == 0 else "  "
-            print(
-                f"  {marker} '{serial_info['serial']}' (confidence: {serial_info['confidence']:.3f}) from {serial_info['source']}"
-            )
-            print(f"      Original text: '{serial_info['original_text']}'")
-        return sorted_serials[0]["serial"]
-    else:
-        print("  No potential serial numbers found")
-        return None
+    # capture to global for CSV sidecar
+    try:
+        global SERIAL_CANDIDATES_LAST
+        SERIAL_CANDIDATES_LAST = [
+            (si["serial"], float(si["confidence"])) for si in sorted_serials[:5]
+        ]
+    except Exception:
+        pass
+    for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
+        marker = "→ SELECTED" if i == 0 else "  "
+        print(
+            f"  {marker} '{serial_info['serial']}' (confidence: {serial_info['confidence']:.3f}) from {serial_info['source']}"
+        )
+        print(f"      Original text: '{serial_info['original_text']}'")
+    return sorted_serials[0]["serial"]
 
 
 def extract_event_type_semantic(results):
@@ -2197,15 +2391,19 @@ for filename in file_list:
 
             # Process non-BMP image formats with enhanced parameters (time OCR)
             _ocr_t0 = time.perf_counter()
-            results = reader.readtext(
-                full_path,
-                detail=1,
-                paragraph=False,
-                text_threshold=0.2,
-                low_text=0.1,
-                link_threshold=0.4,
-                mag_ratio=1.5,
-            )
+            _tmp_out2 = io.StringIO()
+            with contextlib.redirect_stdout(_tmp_out2), contextlib.redirect_stderr(
+                _tmp_out2
+            ):
+                results = reader.readtext(
+                    full_path,
+                    detail=1,
+                    paragraph=False,
+                    text_threshold=0.2,
+                    low_text=0.1,
+                    link_threshold=0.4,
+                    mag_ratio=1.5,
+                )
             _ocr_time_sec = time.perf_counter() - _ocr_t0
             # OCR-only timing (Cell 6 / EasyOCR GPU path)
             log_ocr_time(
@@ -2341,7 +2539,7 @@ for filename in file_list:
 
                         # Check if in target region
                         if top_boundary <= text_center_y <= bottom_boundary:
-                            candidates.append((text, confidence, text_center_y))
+                            candidates.append((text, confidence))
 
                 if candidates:
                     # Return the candidate with highest confidence
@@ -2385,9 +2583,6 @@ for filename in file_list:
             except Exception:
                 top_candidates = ""
 
-            # Compute total time
-            _total_time_sec = time.perf_counter() - _total_t0
-
             # Create CSV record with standardized columns, using 'Missing' for empty values
             csv_record = {
                 "serial_number": str(serial_num) if serial_num else "Missing",
@@ -2404,7 +2599,7 @@ for filename in file_list:
                 "ocr_engine": _ocr_engine,
                 "ocr_device": _ocr_device,
                 "ocr_time_sec": round(_ocr_time_sec, 6),
-                "total_time_sec": round(_total_time_sec, 6),
+                "total_time_sec": round(time.perf_counter() - _total_t0, 6),
                 "top_serial_candidates": top_candidates,
             }
 
@@ -2472,30 +2667,18 @@ for filename in file_list:
 
 print(f"\nProcessing complete!")
 
-# Create and save CSV results to reports folder
-if csv_results:
-    results_df = pd.DataFrame(csv_results)
-    print("\n" + "=" * 80)
-    print("NON-BMP IMAGE EXTRACTION RESULTS (CSV FORMAT)")
-    print("=" * 80)
-    print(results_df.to_csv(index=False))
-
-    # Create reports folder if it doesn't exist
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-
-    # Save to file in reports folder
-    output_file = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    results_df.to_csv(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
-else:
-    print("\nNo results to save.")
-
 
 # %%
-# CELL 7: Non-BMP processing with EasyOCR, Apple Silicon support (MPS-ENABLED)
+# CELL 5: Non-BMP processing with EasyOCR, Apple Silicon (MPS) and Windows (CUDA) support
 
-import os, re, cv2, numpy as np, pandas as pd, matplotlib.pyplot as plt, zipcodes, torch, easyocr
+import os, re, cv2, numpy as np, pandas as pd, matplotlib.pyplot as plt, zipcodes, platform
+import importlib, io, contextlib
+
+# Quietly import heavy libs to suppress banner/warnings (e.g., NNPACK, GPU hints)
+_import_buf = io.StringIO()
+with contextlib.redirect_stdout(_import_buf), contextlib.redirect_stderr(_import_buf):
+    torch = importlib.import_module("torch")
+    easyocr = importlib.import_module("easyocr")
 
 # Toggle MPS here
 USE_MPS = True
@@ -2507,12 +2690,41 @@ os.environ.setdefault(
 _mps_active = False
 _mps_disabled = False
 _mps_fail_notified = False
+# Track selected OCR device for logging/CSV: one of {"CUDA","MPS","CPU"}
+OCR_DEVICE = "CPU"
+
+# Quiet by default: set VERBOSE=True to see device selection and fallback messages
+VERBOSE = False
+
+
+def ocr_info(msg: str):
+    if not VERBOSE:
+        return
+    try:
+        ocr_log(msg)
+    except Exception:
+        try:
+            print(msg)
+        except Exception:
+            pass
 
 
 def init_easyocr():
-    global _mps_active, _mps_disabled
+    global _mps_active, _mps_disabled, OCR_DEVICE
+    # Prefer CUDA on Windows with Nvidia GPU
+    try:
+        if platform.system() == "Windows" and torch.cuda.is_available():
+            ocr_info(
+                "Initializing EasyOCR with CUDA on Windows (Nvidia GPU detected)..."
+            )
+            OCR_DEVICE = "CUDA"
+            return easyocr.Reader(["en"], gpu=True)
+    except Exception:
+        pass
+
+    # Otherwise, try Apple Silicon MPS (manual model move), with CPU fallback
     if USE_MPS and MPS_AVAILABLE and not _mps_disabled:
-        print("Initializing EasyOCR on Apple MPS (experimental)...")
+        ocr_info("Initializing EasyOCR on Apple MPS (experimental)...")
         rdr = easyocr.Reader(["en"], gpu=False)  # gpu flag is CUDA-only
         try:
             mps_device = torch.device("mps")
@@ -2522,22 +2734,28 @@ def init_easyocr():
                 if mdl and hasattr(mdl, "to"):
                     mdl.to(mps_device)
             _mps_active = True
-            print("MPS models loaded.")
+            OCR_DEVICE = "MPS"
+            ocr_info("MPS models loaded.")
         except Exception as e:
-            print(f"MPS model move failed: {e}. Using CPU.")
+            ocr_info(f"MPS model move failed: {e}. Using CPU.")
             _mps_active = False
+            OCR_DEVICE = "CPU"
         return rdr
-    print("Using CPU (MPS disabled or unavailable).")
-    return easyocr.Reader(["en"], gpu=False)
+
+    ocr_info("Using CPU (no CUDA/MPS available or disabled).")
+    OCR_DEVICE = "CPU"
+    _tmp = io.StringIO()
+    with contextlib.redirect_stdout(_tmp), contextlib.redirect_stderr(_tmp):
+        return easyocr.Reader(["en"], gpu=False)
 
 
 reader = init_easyocr()
 
 
 def switch_to_cpu():
-    global reader, _mps_active, _mps_disabled
+    global reader, _mps_active, _mps_disabled, OCR_DEVICE
     if _mps_active:
-        print("Switching models to CPU...")
+        ocr_info("Switching models to CPU...")
         try:
             cpu_device = torch.device("cpu")
             for attr in ("detector", "recognizer", "model"):
@@ -2548,24 +2766,32 @@ def switch_to_cpu():
             pass
     _mps_active = False
     _mps_disabled = True
+    OCR_DEVICE = "CPU"
 
 
 def readtext_stable(image_or_path, **kwargs):
-    global _mps_fail_notified
+    global _mps_fail_notified, OCR_DEVICE
     try:
-        return reader.readtext(image_or_path, **kwargs)
+        _tmp = io.StringIO()
+        with contextlib.redirect_stdout(_tmp), contextlib.redirect_stderr(_tmp):
+            return reader.readtext(image_or_path, **kwargs)
     except RuntimeError as e:
         msg = str(e).lower()
         if _mps_active and (
             "mps" in msg or "same device" in msg or "slow_conv2d" in msg
         ):
             if not _mps_fail_notified:
-                print("MPS runtime issue encountered -> permanent CPU fallback.")
+                ocr_info("MPS runtime issue encountered -> permanent CPU fallback.")
                 _mps_fail_notified = True
             switch_to_cpu()
             # Rebuild reader on CPU for safety
-            reader_cpu = easyocr.Reader(["en"], gpu=False)
-            return reader_cpu.readtext(image_or_path, **kwargs)
+            _tmp2 = io.StringIO()
+            with contextlib.redirect_stdout(_tmp2), contextlib.redirect_stderr(_tmp2):
+                reader_cpu = easyocr.Reader(["en"], gpu=False)
+            OCR_DEVICE = "CPU"
+            _tmp3 = io.StringIO()
+            with contextlib.redirect_stdout(_tmp3), contextlib.redirect_stderr(_tmp3):
+                return reader_cpu.readtext(image_or_path, **kwargs)
         raise
 
 
@@ -2675,21 +2901,35 @@ def extract_serial(results, full_path):
                     score *= 1.2
                 elif len(cleaned) >= 6:
                     score *= 1.1
-                cands.append((cleaned, t, score, tag))
+                cands.append(
+                    {
+                        "serial": cleaned,
+                        "original_text": text,
+                        "confidence": score,
+                        "source": tag,
+                        "bbox": None,
+                    }
+                )
 
     add(results, "base", 1.0)
     for tag, imgp in preprocess(full_path):
         try:
-            r = readtext_stable(
-                imgp,
-                detail=1,
-                paragraph=False,
-                text_threshold=0.15,
-                low_text=0.05,
-                link_threshold=0.3,
-                mag_ratio=2.0,
-            )
-            add(r, tag, 0.9)
+            # Run OCR on preprocessed image (suppress noisy stdout/stderr)
+            _tmp_out = io.StringIO()
+            with contextlib.redirect_stdout(_tmp_out), contextlib.redirect_stderr(
+                _tmp_out
+            ):
+                prep_results = reader.readtext(
+                    imgp,
+                    detail=1,
+                    paragraph=False,
+                    text_threshold=0.15,
+                    low_text=0.05,
+                    link_threshold=0.3,
+                    mag_ratio=2.0,
+                )
+
+            add(prep_results, tag, 0.9)
         except Exception:
             pass
     if not cands:
@@ -2707,9 +2947,10 @@ def extract_serial(results, full_path):
         SERIAL_CANDIDATES_LAST = [(s, float(sc)) for (s, orig, sc, src) in ordered[:5]]
     except Exception:
         pass
-    for i, (s, orig, sc, src) in enumerate(ordered[:5]):
+    for i, (s, orig, sc, src) in enumerate(ordered[:5]):  # Show top 5
         mark = "→ SELECTED" if i == 0 else "  "
         print(f"  {mark} '{s}' (score {sc:.3f}) from {src} | raw: '{orig}'")
+        print(f"      Original text: '{orig}'")
     return ordered[0][0]
 
 
@@ -2727,1126 +2968,39 @@ print(f"Found {len(file_list)} files in test folder")
 
 for filename in file_list:
     full_path = os.path.join(test_folder, filename)
-    if os.path.isdir(full_path):
-        continue
-    if filename.lower().endswith(".bmp"):
-        continue  # handled elsewhere
-    if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
-        continue
-    print(f"\nProcessing: {filename}")
-    _total_t0 = time.perf_counter()
-    try:
-        _ocr_t0 = time.perf_counter()
-        results = readtext_stable(
-            full_path,
-            detail=1,
-            paragraph=False,
-            text_threshold=0.2,
-            low_text=0.1,
-            link_threshold=0.4,
-            mag_ratio=1.5,
-        )
-        ocr_time_sec = time.perf_counter() - _ocr_t0
-        # OCR-only timing (Cell 8 / EasyOCR MPS fallback)
-        _device = "MPS" if ("_mps_active" in locals() and _mps_active) else "CPU"
-        log_ocr_time("cell8", "EasyOCR", _device, full_path, ocr_time_sec)
-        print("\n--- OCR-Focused Serial Number Detection ---")
-        serial_num = extract_serial(results, full_path)
-        print("--- End OCR-Focused Serial Number Detection ---")
-
-        # Simple metadata extraction (unchanged logic)
-        name = addy = date = zipcode = city = state = None
-        name_pat = r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b"
-        address_pat = r"\b\d{1,5}\s[A-Z][a-z]+\s[A-Z][a-z]+\b"
-        date_pat = r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
-        zipcode_pat = r"\b\d{5}(-\d{4})?\b"
-
-        for _, text, conf in results:
-            if not name and conf > 0.8 and re.search(name_pat, text):
-                name = re.search(name_pat, text).group()
-            if not addy and re.search(address_pat, text):
-                addy = re.search(address_pat, text).group()
-            if not date and re.search(date_pat, text):
-                date = re.search(date_pat, text).group()
-            if name and addy and date:
-                break
-
-        event_type = extract_event_type_semantic(results)
-
-        if results:
-            try:
-                ys = [p[1] for b, _, _ in results for p in b]
-                H = max(ys) if ys else 0
-            except Exception:
-                H = 0
-            top, bottom = H * 0.25, H * 0.5
-            zcands = []
-            for b, text, conf in results:
-                t = text.strip()
-                if re.match(zipcode_pat, t):
-                    try:
-                        top_y = min(p[1] for p in b)
-                        bottom_y = max(p[1] for p in b)
-                        cy = (top_y + bottom_y) / 2
-                    except Exception:
-                        cy = 0
-                    if top <= cy <= bottom:
-                        zcands.append((t, conf))
-            if zcands:
-                zipcode = max(zcands, key=lambda x: x[1])[0]
-                try:
-                    loc = zipcodes.matching(zipcode)
-                    if loc:
-                        city = loc[0]["city"]
-                        state = loc[0]["state"]
-                except Exception:
-                    pass
-
-        complete_address = ""
-        if addy:
-            complete_address = addy
-            if city and state:
-                complete_address += f", {city}, {state}"
-                if zipcode:
-                    complete_address += f" {zipcode}"
-            elif zipcode:
-                complete_address += f" {zipcode}"
-
-        metadata = get_file_metadata(full_path)
-        relative_path = os.path.join("test", filename)
-
-        # Build top-5 candidates string from global
-        try:
-            top_candidates = "; ".join(
-                [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
-            )
-        except Exception:
-            top_candidates = ""
-
-        csv_results.append(
-            {
-                "serial_number": serial_num or "Missing",
-                "event_type": event_type or "Missing",
-                "event_date": date or "Missing",
-                "associated_name": name or "Missing",
-                "associated_address": complete_address or "Missing",
-                "source_file": relative_path,
-                "file_created": metadata["file_creation_date"],
-                "file_modified": metadata["file_modification_date"],
-                # Instrumentation
-                "ocr_engine": "EasyOCR",
-                "ocr_device": "MPS" if _mps_active else "CPU",
-                "ocr_time_sec": (
-                    round(ocr_time_sec, 4) if "ocr_time_sec" in locals() else None
-                ),
-                "total_time_sec": round(time.perf_counter() - _total_t0, 4),
-                "top_serial_candidates": top_candidates,
-            }
-        )
-
-        # Legacy df1 append
-        df1 = pd.concat(
-            [
-                df1,
-                pd.DataFrame(
-                    [
-                        {
-                            "serial_number": serial_num,
-                            "name": name,
-                            "address": addy,
-                            "date": date,
-                            "zipcode": zipcode,
-                            "city": city,
-                            "state": state,
-                        }
-                    ]
-                ),
-            ],
-            ignore_index=True,
-        )
-
-        if serial_num:
-            sel = df1["serial_number"] == serial_num
-            df1.loc[sel, "filename"] = metadata["filename"]
-            df1.loc[sel, "file_creation_date"] = metadata["file_creation_date"]
-            df1.loc[sel, "file_modification_date"] = metadata["file_modification_date"]
-            df1.loc[sel, "file_location"] = metadata["file_location"]
-
-        print("Summary:")
-        print("  Serial :", serial_num or "Missing")
-        print("  Event  :", event_type or "Missing")
-        print("  Name   :", name or "Missing")
-        print("  Address:", complete_address or "Missing")
-        print("  Date   :", date or "Missing")
-        print("  Zip    :", zipcode or "Missing")
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-print("\nProcessing complete!")
-
-if csv_results:
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-    out = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    pd.DataFrame(csv_results).to_csv(out, index=False)
-    print(f"Results saved to: {out}")
-else:
-    print("No results to save.")
-
-
-# %%
-# CELL 8: Non-BMP processing with EasyOCR + Apple Silicon (MPS) fallback
-
-import os, re, cv2, numpy as np, pandas as pd, zipcodes, torch, easyocr
-from typing import List, Tuple
-
-# Assumes:
-# - df1 DataFrame already exists (earlier cells)
-# - get_file_metadata(full_path) already defined (Cell 2)
-
-# ---------------- Configuration ----------------
-USE_MPS = True  # Try to use Apple Silicon MPS
-VERBOSE_DEVICES = True  # Extra diagnostics
-FORCE_READER_REINIT = True  # Always rebuild reader in this cell (isolated)
-ALLOWED_EXT = (".jpg", ".jpeg", ".png", ".tiff", ".gif")
-
-# ---------------- MPS Reader Initialization ----------------
-_mps_available = torch.backends.mps.is_available()
-_target_device = (
-    torch.device("mps") if (USE_MPS and _mps_available) else torch.device("cpu")
-)
-
-if USE_MPS and not _mps_available:
-    print("MPS not available -> using CPU.")
-
-_reader = None
-_mps_active = False
-_fallback_used = False
-
-
-def _summarize_param_devices(rdr: easyocr.Reader) -> set:
-    devs = set()
-    for attr in ("detector", "recognizer"):
-        mdl = getattr(rdr, attr, None)
-        if mdl:
-            for p in mdl.parameters():
-                devs.add(p.device.type)
-    return devs
-
-
-def _move_model_to(device: torch.device, rdr: easyocr.Reader):
-    # EasyOCR: detector, recognizer (recognizer.model nested)
-    for attr in ("detector", "recognizer"):
-        mdl = getattr(rdr, attr, None)
-        if mdl:
-            try:
-                mdl.to(device)
-            except Exception as e:
-                if VERBOSE_DEVICES:
-                    print(f"  Warn: could not move {attr}: {e}")
-            sub = getattr(mdl, "model", None)
-            if sub:
-                try:
-                    sub.to(device)
-                except Exception as e:
-                    if VERBOSE_DEVICES:
-                        print(f"  Warn: could not move nested model in {attr}: {e}")
-
-
-def _init_reader() -> easyocr.Reader:
-    global _mps_active
-    # EasyOCR's gpu=True only targets CUDA, so keep gpu=False and move manually.
-    rdr = easyocr.Reader(["en"], gpu=False)
-    if _target_device.type == "mps":
-        try:
-            rdr.device = _target_device
-            _move_model_to(_target_device, rdr)
-            devs = _summarize_param_devices(rdr)
-            print(f"EasyOCR initialized (requested MPS). Parameter devices: {devs}")
-            if "mps" in devs:
-                _mps_active = True
-                print("MPS active.")
-            else:
-                print("Parameters not on MPS -> CPU execution.")
-        except Exception as e:
-            print(f"MPS move failed: {e} -> CPU only.")
-            _mps_active = False
-    else:
-        print("EasyOCR initialized on CPU.")
-    return rdr
-
-
-def get_reader():
-    global _reader
-    if _reader is None or FORCE_READER_REINIT:
-        if _reader is not None and FORCE_READER_REINIT:
-            print("Reinitializing EasyOCR reader...")
-        _reader = _init_reader()
-    return _reader
-
-
-reader = get_reader()
-
-
-# ---------------- Robust readtext wrapper ----------------
-def readtext_stable(image_or_ndarray, **kwargs):
-    """
-    Run OCR, fallback to CPU once if MPS raises runtime issues (device mismatch / slow_conv2d).
-    """
-    global reader, _fallback_used, _mps_active
-    try:
-        return reader.readtext(image_or_ndarray, **kwargs)
-    except RuntimeError as e:
-        msg = str(e).lower()
-        trigger = any(
-            k in msg
-            for k in ("mps", "slow_conv2d", "same device", "metalperformanceshaders")
-        )
-        if _mps_active and trigger and not _fallback_used:
-            print("MPS runtime issue -> rebuilding on CPU for remainder of session.")
-            _fallback_used = True
-            _mps_active = False
-            reader = easyocr.Reader(["en"], gpu=False)
-            return reader.readtext(image_or_ndarray, **kwargs)
-        raise
-
-
-# ---------------- Event Type Extraction ----------------
-def extract_event_type_semantic(results: List[Tuple]) -> str | None:
-    incident_types = {
-        "burglary": "Burglary",
-        "robbery": "Robbery",
-        "larceny": "Larceny",
-        "theft": "Theft",
-        "stolen": "Theft",
-        "missing": "Missing",
-        "lost": "Loss",
-    }
-    excluded = {
-        "atf",
-        "bureau",
-        "federal",
-        "department",
-        "justice",
-        "alcohol",
-        "tobacco",
-        "firearms",
-        "explosives",
-        "form",
-        "section",
-        "page",
-        "number",
-        "code",
-        "licensee",
-        "information",
-        "details",
-        "description",
-        "brief",
-        "name",
-        "address",
-        "telephone",
-        "date",
-        "time",
-        "signature",
-        "certification",
-    }
-    purpose_patterns = [
-        (
-            r"(Theft|Loss|Stolen|Missing|Burglary|Robbery|Larceny).*?Report",
-            "Theft/Loss",
-        ),
-        (r"Inventory\s+(Theft|Loss)", "Theft/Loss"),
-        (
-            r"(Purchase|Sale|Transfer|Registration|Acquisition|Disposition).*?Report",
-            None,
-        ),
-    ]
-    import re
-
-    cands = []
-    for pat, fixed in purpose_patterns:
-        for _, text, conf in results:
-            m = re.search(pat, text, re.IGNORECASE)
-            if m and conf > 0.4:
-                cands.append(
-                    (fixed if fixed else m.group(1).title(), conf + 1.0, "purpose")
-                )
-    for _, text, conf in results:
-        t = text.lower().strip()
-        if t in incident_types and conf > 0.5:
-            cands.append((incident_types[t], conf + 0.8, "incident"))
-    if not cands:
-        return None
-    order = {"purpose": 2, "incident": 1}
-    cands.sort(key=lambda x: (order.get(x[2], 0), x[1]), reverse=True)
-    return cands[0][0]
-
-
-# ---------------- Serial Extraction (multi-pass) ----------------
-def extract_serial(results, full_path: str):
-    import cv2, numpy as np
-
-    def preprocess(path):
-        im = cv2.imread(path)
-        if im is None:
-            return []
-        g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-        out = [("gray", g)]
-        out.append(("blur", cv2.GaussianBlur(g, (3, 3), 0)))
-        sharp = cv2.filter2D(g, -1, np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]]))
-        out.append(("sharp", sharp))
-        thr = cv2.adaptiveThreshold(
-            g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        out.append(("thr", thr))
-        return out
-
-    cands = []
-
-    def add(res, tag, penalty=1.0):
-        for _, text, conf in res:
-            t = text.strip()
-            if not t:
-                continue
-            cleaned = "".join(c for c in t if c.isalnum())
-            if 4 <= len(cleaned) <= 15:
-                has_a = any(c.isalpha() for c in cleaned)
-                has_d = any(c.isdigit() for c in cleaned)
-                score = conf * penalty
-                if has_a and has_d:
-                    score *= 1.2
-                elif len(cleaned) >= 6:
-                    score *= 1.1
-                cands.append((cleaned, t, score, tag))
-
-    add(results, "base", 1.0)
-    for tag, imgp in preprocess(full_path):
-        try:
-            r = readtext_stable(
-                imgp,
-                detail=1,
-                paragraph=False,
-                text_threshold=0.15,
-                low_text=0.05,
-                link_threshold=0.3,
-                mag_ratio=2.0,
-            )
-            add(r, tag, 0.9)
-        except Exception:
-            pass
-    if not cands:
-        print("  No serial candidates.")
-        return None
-    # Deduplicate keep best score
-    best = {}
-    for serial, orig, sc, src in cands:
-        if serial not in best or sc > best[serial][2]:
-            best[serial] = (serial, orig, sc, src)
-    ordered = sorted(best.values(), key=lambda x: x[2], reverse=True)
-    print("Serial number candidates:")
-    for i, (s, orig, sc, src) in enumerate(ordered[:5]):
-        mark = "→ SELECTED" if i == 0 else "  "
-        print(f"  {mark} '{s}' (score {sc:.3f}) from {src} | raw: '{orig}'")
-    return ordered[0][0]
-
-
-# ---------------- Ensure df1 has required metadata columns ----------------
-for col in (
-    "filename",
-    "file_creation_date",
-    "file_modification_date",
-    "file_location",
-):
-    if col not in df1.columns:
-        df1[col] = ""
-    df1[col] = df1[col].astype(str)
-
-# ---------------- Collect files ----------------
-test_folder = os.path.join(os.getcwd(), "test")
-if not os.path.isdir(test_folder):
-    raise RuntimeError(f"Test folder not found: {test_folder}")
-
-file_list = os.listdir(test_folder)
-csv_results = []
-print(f"Found {len(file_list)} files in test folder")
-
-# ---------------- Processing Loop ----------------
-for filename in file_list:
-    full_path = os.path.join(test_folder, filename)
-    if os.path.isdir(full_path):
-        continue
-    if filename.lower().endswith(".bmp"):
-        continue  # handled by dedicated BMP cell
-    if not filename.lower().endswith(ALLOWED_EXT):
-        continue
-
-    print(f"\nProcessing: {filename}")
-    try:
-        results = readtext_stable(
-            full_path,
-            detail=1,
-            paragraph=False,
-            text_threshold=0.2,
-            low_text=0.1,
-            link_threshold=0.4,
-            mag_ratio=1.5,
-        )
-
-        print("\n--- OCR-Focused Serial Number Detection ---")
-        serial_num = extract_serial(results, full_path)
-        print("--- End OCR-Focused Serial Number Detection ---")
-
-        name = addy = date = zipcode = city = state = None
-        name_pat = r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b"
-        address_pat = r"\b\d{1,5}\s[A-Z][a-z]+\s[A-Z][a-z]+\b"
-        date_pat = r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
-        zipcode_pat = r"\b\d{5}(-\d{4})?\b"
-
-        for _, text, conf in results:
-            if not name and conf > 0.8:
-                m = re.search(name_pat, text)
-                if m:
-                    name = m.group()
-            if not addy:
-                m = re.search(address_pat, text)
-                if m:
-                    addy = m.group()
-            if not date:
-                m = re.search(date_pat, text)
-                if m:
-                    date = m.group()
-            if name and addy and date:
-                break
-
-        event_type = extract_event_type_semantic(results)
-
-        # Zipcode with positional filter (middle region)
-        if results:
-            try:
-                all_y = [pt[1] for b, _, _ in results for pt in b]
-                H = max(all_y) if all_y else 0
-            except Exception:
-                H = 0
-            top, bottom = H * 0.25, H * 0.50
-            zcands = []
-            for b, text, conf in results:
-                t = text.strip()
-                if re.match(zipcode_pat, t):
-                    try:
-                        top_y = min(p[1] for p in b)
-                        bot_y = max(p[1] for p in b)
-                        cy = (top_y + bot_y) / 2
-                    except Exception:
-                        cy = 0
-                    if top <= cy <= bottom:
-                        zcands.append((t, conf))
-            if zcands:
-                zipcode = max(zcands, key=lambda x: x[1])[0]
-                try:
-                    loc = zipcodes.matching(zipcode)
-                    if loc:
-                        city = loc[0]["city"]
-                        state = loc[0]["state"]
-                except Exception:
-                    pass
-
-        complete_address = ""
-        if addy:
-            complete_address = addy
-            if city and state:
-                complete_address += f", {city}, {state}"
-                if zipcode:
-                    complete_address += f" {zipcode}"
-            elif zipcode:
-                complete_address += f" {zipcode}"
-
-        metadata = get_file_metadata(full_path)
-        relative_path = os.path.join("test", filename)
-
-        csv_results.append(
-            {
-                "serial_number": serial_num or "Missing",
-                "event_type": event_type or "Missing",
-                "event_date": date or "Missing",
-                "associated_name": name or "Missing",
-                "associated_address": complete_address or "Missing",
-                "source_file": relative_path,
-                "file_created": metadata["file_creation_date"],
-                "file_modified": metadata["file_modification_date"],
-            }
-        )
-
-        # Legacy-style append to df1
-        legacy_row = {
-            "serial_number": serial_num,
-            "name": name,
-            "address": addy,
-            "date": date,
-            "zipcode": zipcode,
-            "city": city,
-            "state": state,
-        }
-        df1 = pd.concat([df1, pd.DataFrame([legacy_row])], ignore_index=True)
-
-        if serial_num:
-            sel = df1["serial_number"] == serial_num
-            df1.loc[sel, "filename"] = metadata["filename"]
-            df1.loc[sel, "file_creation_date"] = metadata["file_creation_date"]
-            df1.loc[sel, "file_modification_date"] = metadata["file_modification_date"]
-            df1.loc[sel, "file_location"] = metadata["file_location"]
-
-        print("Summary:")
-        print("  Serial :", serial_num or "Missing")
-        print("  Event  :", event_type or "Missing")
-        print("  Name   :", name or "Missing")
-        print("  Address:", complete_address or "Missing")
-        print("  Date   :", date or "Missing")
-        print("  Zip    :", zipcode or "Missing")
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-print("\nProcessing complete!")
-
-# ---------------- Write CSV Output ----------------
-if csv_results:
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-    out_csv = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    pd.DataFrame(csv_results).to_csv(out_csv, index=False)
-    print(f"Results saved to: {out_csv}")
-else:
-    print("No results to save.")
-
-# ---------------- Diagnostics ----------------
-if VERBOSE_DEVICES:
-    try:
-        devs = _summarize_param_devices(reader)
-        print(
-            "Final reader param devices:",
-            devs,
-            "| MPS active:",
-            _mps_active,
-            "| Fallback used:",
-            _fallback_used,
-            "| reader.device:",
-            getattr(reader, "device", "N/A"),
-        )
-    except Exception:
-        pass
-
-
-# %%
-# CELL 9: Process non BMP image files with OCR-focused serial extraction and CSV output
-# Apple Silicon GPU (MPS) first, with automatic CPU fallback
-
-# Safe imports (ok to re-import in a notebook cell)
-import os
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import re
-import zipcodes
-import torch  # for MPS (Apple Silicon GPU)
-import easyocr
-
-# Add metadata columns to df1
-df1["filename"] = df1["filename"].astype(str)
-df1["file_creation_date"] = df1["file_creation_date"].astype(str)
-df1["file_modification_date"] = df1["file_modification_date"].astype(str)
-df1["file_location"] = df1["file_location"].astype(str)
-
-# Path to 'test' folder
-test_folder = os.path.join(os.getcwd(), "test")
-
-# Decide device and set default BEFORE constructing EasyOCR reader
-mps_available = torch.backends.mps.is_available()
-device = "mps" if mps_available else "cpu"
-try:
-    if mps_available:
-        torch.set_default_device("mps")
-        print("Using Apple Silicon GPU (MPS) by default.")
-    else:
-        print("MPS not available; using CPU.")
-except Exception as e:
-    print(f"Warning: Could not set default device to MPS: {e}")
-    device = "cpu"
-
-
-def make_reader(on_device: str):
-    """
-    Construct an EasyOCR reader targeting the given device.
-    Note: EasyOCR's 'gpu=True' assumes CUDA, so we keep gpu=False, and rely on
-    PyTorch default device (set above) to place tensors/models on MPS.
-    """
-    # Create reader with gpu=False (CUDA-only flag). Tensors will follow default device.
-    rdr = easyocr.Reader(["en"], gpu=False)
-    return rdr
-
-
-# Create initial reader on desired device
-reader = make_reader(device)
-
-
-# Helper: robust OCR with device fallback
-def readtext_with_fallback(reader_obj, image_or_path, **kwargs):
-    """
-    Try OCR with current device. On MPS-specific device mismatch errors,
-    fallback to CPU by rebuilding the reader and retrying once.
-    """
-    try:
-        return reader_obj.readtext(image_or_path, **kwargs)
-    except RuntimeError as e:
-        msg = str(e)
-        # Known MPS error: input on CPU, model on MPS or similar mismatch
-        if (
-            "slow_conv2d_forward_mps" in msg
-            or "must be on the same device" in msg
-            or "mps" in msg.lower()
-        ):
-            print("MPS error detected. Falling back to CPU and retrying once...")
-            try:
-                # Switch default device back to CPU
-                torch.set_default_device("cpu")
-            except Exception:
-                pass
-            rdr_cpu = make_reader("cpu")
-            return rdr_cpu.readtext(image_or_path, **kwargs)
-        else:
-            raise
-
-
-# Get all files in 'test' folder (we'll still skip BMPs in the loop)
-file_list = os.listdir(test_folder)
-
-# Initialize CSV results list
-csv_results = []
-
-print(f"Found {len(file_list)} files in test folder")
-
-
-def extract_serial_with_improved_ocr(results, full_path):
-    """Extract serial number focusing on OCR accuracy improvements"""
-
-    def preprocess_image_for_ocr(image_path):
-        """Apply image preprocessing to improve OCR accuracy"""
-        import cv2
-        import numpy as np
-
-        # Load image
-        img = cv2.imread(image_path)
-        if img is None:
-            return None
-
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Apply different preprocessing techniques
-        preprocessed_images = []
-
-        # Original grayscale
-        preprocessed_images.append(("original_gray", gray))
-
-        # Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        preprocessed_images.append(("blurred", blurred))
-
-        # Sharpen
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(gray, -1, kernel)
-        preprocessed_images.append(("sharpened", sharpened))
-
-        # Adaptive threshold
-        adaptive = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        preprocessed_images.append(("adaptive_thresh", adaptive))
-
-        # Morphological operations to clean up
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
-        preprocessed_images.append(("morphological", morph))
-
-        return preprocessed_images
-
-    def run_multiple_ocr_passes(image_path):
-        """Run OCR with different parameters and preprocessing"""
-        all_candidates = []
-
-        # Standard OCR (already done)
-        for bbox, text, confidence in results:
-            if text.strip() and confidence > 0.3:
-                all_candidates.append(
-                    {
-                        "text": text.strip(),
-                        "confidence": confidence,
-                        "source": "standard_ocr",
-                        "bbox": bbox,
-                    }
-                )
-
-        # Try different preprocessing
-        preprocessed_images = preprocess_image_for_ocr(image_path)
-        if preprocessed_images:
-            for prep_name, prep_img in preprocessed_images:
-                try:
-                    # Run OCR on preprocessed image (with device fallback)
-                    prep_results = readtext_with_fallback(
-                        reader,
-                        prep_img,
-                        detail=1,
-                        paragraph=False,
-                        text_threshold=0.1,  # Lower threshold
-                        low_text=0.05,
-                        link_threshold=0.3,
-                        mag_ratio=2.0,  # Higher magnification
-                    )
-
-                    for bbox, text, confidence in prep_results:
-                        if (
-                            text.strip() and confidence > 0.2
-                        ):  # Lower threshold for preprocessed
-                            all_candidates.append(
-                                {
-                                    "text": text.strip(),
-                                    "confidence": confidence
-                                    * 0.9,  # Slight penalty for preprocessed
-                                    "source": f"preprocessed_{prep_name}",
-                                    "bbox": bbox,
-                                }
-                            )
-                except Exception as e:
-                    print(f"Error with {prep_name} preprocessing: {e}")
-
-        return all_candidates
-
-    def find_potential_serials(candidates):
-        """Find potential serial numbers from all OCR candidates"""
-        potential_serials = []
-
-        # Common words that are clearly NOT serial numbers
-        non_serial_words = {
-            "date",
-            "city",
-            "state",
-            "name",
-            "address",
-            "phone",
-            "email",
-            "zip",
-            "code",
-            "serial",
-            "number",
-            "model",
-            "make",
-            "caliber",
-            "type",
-            "manufacturer",
-            "license",
-            "permit",
-            "registration",
-            "form",
-            "page",
-            "section",
-            "dallas",
-            "texas",
-            "california",
-            "florida",
-            "new",
-            "york",
-            "smith",
-            "wesson",
-            "colt",
-            "ruger",
-            "glock",
-            "sig",
-            "sauer",
-            "the",
-            "and",
-            "for",
-            "with",
-            "this",
-            "that",
-            "from",
-            "have",
-            "been",
-            "firearm",
-            "pistol",
-            "rifle",
-            "gun",
-            "weapon",
-            "barrel",
-            "frame",
-            "slide",
-        }
-
-        for candidate in candidates:
-            text = candidate["text"]
-            confidence = candidate["confidence"]
-            source = candidate["source"]
-
-            # Remove spaces and special characters
-            cleaned = "".join(c for c in text if c.isalnum())
-
-            # Skip if it's clearly not a serial number
-            if cleaned.lower() in non_serial_words:
-                continue
-
-            # Skip if it's all letters and looks like a common word (likely not a serial)
-            if cleaned.isalpha() and len(cleaned) <= 8:
-                continue
-
-            # Check if it could be a serial (basic length check)
-            if 4 <= len(cleaned) <= 15 and cleaned.isalnum():
-                # Additional check: prefer mixed alphanumeric or longer sequences
-                has_letters = any(c.isalpha() for c in cleaned)
-                has_numbers = any(c.isdigit() for c in cleaned)
-
-                # Boost confidence for mixed alphanumeric (more likely to be serials)
-                if has_letters and has_numbers:
-                    confidence *= 1.2
-                elif len(cleaned) >= 6:  # Or longer sequences
-                    confidence *= 1.1
-
-                potential_serials.append(
-                    {
-                        "serial": cleaned,
-                        "original_text": text,
-                        "confidence": confidence,
-                        "source": source,
-                        "bbox": candidate["bbox"],
-                    }
-                )
-
-            # Also try spaced character reconstruction for this candidate
-            if " " in text and len(text.split()) >= 3:
-                parts = [p.strip() for p in text.split() if p.strip().isalnum()]
-                if len(parts) >= 3:
-                    reconstructed = "".join(parts)
-                    if (
-                        4 <= len(reconstructed) <= 15
-                        and reconstructed.isalnum()
-                        and reconstructed.lower() not in non_serial_words
-                    ):
-                        potential_serials.append(
-                            {
-                                "serial": reconstructed,
-                                "original_text": text,
-                                "confidence": confidence * 0.8,
-                                "source": f"{source}_reconstructed",
-                                "bbox": candidate["bbox"],
-                            }
-                        )
-
-        return potential_serials
-
-    # Run multiple OCR passes
-    print("Running multiple OCR passes for improved accuracy...")
-    all_candidates = run_multiple_ocr_passes(full_path)
-
-    # Find potential serials
-    potential_serials = find_potential_serials(all_candidates)
-
-    # Remove duplicates and sort by confidence
-    unique_serials = {}
-    for serial_info in potential_serials:
-        serial = serial_info["serial"]
-        if (
-            serial not in unique_serials
-            or serial_info["confidence"] > unique_serials[serial]["confidence"]
-        ):
-            unique_serials[serial] = serial_info
-
-    # Sort by confidence
-    sorted_serials = sorted(
-        unique_serials.values(), key=lambda x: x["confidence"], reverse=True
-    )
-
-    # Display top candidates for transparency
-    print(f"\nSerial number candidates found:")
-    # Capture to global for downstream CSV
-    global SERIAL_CANDIDATES_LAST
-    SERIAL_CANDIDATES_LAST = [
-        (si["serial"], float(si["confidence"])) for si in sorted_serials[:5]
-    ]
-    if sorted_serials:
-        for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
-            marker = "→ SELECTED" if i == 0 else "  "
-            print(
-                f"  {marker} '{serial_info['serial']}' (confidence: {serial_info['confidence']:.3f}) from {serial_info['source']}"
-            )
-            print(f"      Original text: '{serial_info['original_text']}'")
-        return sorted_serials[0]["serial"]
-    else:
-        print("  No potential serial numbers found")
-        return None
-
-
-def extract_event_type_semantic(results):
-    """
-    Mirror BMP-style event detection with semantic priorities.
-    Returns best event_type or None.
-    """
-    import re
-
-    event_candidates = []
-
-    # Excluded administrative words
-    excluded_words = {
-        "atf",
-        "bureau",
-        "federal",
-        "department",
-        "justice",
-        "alcohol",
-        "tobacco",
-        "firearms",
-        "explosives",
-        "form",
-        "section",
-        "page",
-        "number",
-        "code",
-        "licensee",
-        "information",
-        "details",
-        "description",
-        "brief",
-        "name",
-        "address",
-        "telephone",
-        "date",
-        "time",
-        "signature",
-        "certification",
-    }
-
-    # Priority 1: Document purpose indicators
-    purpose_patterns = [
-        (
-            r"(Theft|Loss|Stolen|Missing|Burglary|Robbery|Larceny).*?Report",
-            "Theft/Loss",
-        ),
-        (r"Inventory\s+(Theft|Loss)", "Theft/Loss"),
-        (
-            r"(Purchase|Sale|Transfer|Registration|Acquisition|Disposition).*?Report",
-            None,
-        ),
-    ]
-
-    for pattern, fixed_event in purpose_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.4:
-                event = fixed_event if fixed_event else m.group(1).title()
-                event_candidates.append((event, conf + 1.0, "document_purpose", text))
-
-    # Priority 2: Specific incident/crime types
-    incident_types = {
-        "burglary": "Burglary",
-        "robbery": "Robbery",
-        "larceny": "Larceny",
-        "theft": "Theft",
-        "stolen": "Theft",
-        "missing": "Missing",
-        "lost": "Loss",
-    }
-    for _, text, conf in results:
-        text_clean = text.lower().strip()
-        if text_clean in incident_types and conf > 0.5:
-            event_candidates.append(
-                (incident_types[text_clean], conf + 0.8, "incident_type", text)
-            )
-
-    # Priority 3: Action descriptions
-    action_patterns = [
-        (r"was\s+(stolen|taken|missing|lost)", None),
-        (r"were\s+(stolen|taken|missing|lost)", None),
-        (r"firearm\s+was\s+(\w+)", None),
-        (r"gun\s+was\s+(\w+)", None),
-    ]
-    for pattern, _ in action_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.6:
-                action = m.group(1).lower()
-                if action in incident_types:
-                    event_candidates.append(
-                        (incident_types[action], conf + 0.6, "action_description", text)
-                    )
-
-    # Priority 4: Section headers
-    section_patterns = [
-        (r"(Theft|Loss|Stolen|Missing)\s+Information", None),
-        (r"(Purchase|Sale|Transfer)\s+Information", None),
-    ]
-    for pattern, _ in section_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.6:
-                event = m.group(1).title()
-                if event.lower() not in excluded_words:
-                    event_candidates.append((event, conf + 0.4, "section_header", text))
-
-    # Priority 5: Meaningful single words
-    for _, text, conf in results:
-        t = text.strip()
-        if len(t.split()) == 1 and len(t) > 3 and conf > 0.7 and t.isalpha():
-            low = t.lower()
-            if low not in excluded_words and low in incident_types:
-                event_candidates.append(
-                    (incident_types[low], conf + 0.2, "meaningful_word", text)
-                )
-
-    if not event_candidates:
-        return None
-
-    priority_order = {
-        "document_purpose": 5,
-        "incident_type": 4,
-        "action_description": 3,
-        "section_header": 2,
-        "meaningful_word": 1,
-    }
-    event_candidates.sort(
-        key=lambda x: (priority_order.get(x[2], 0), x[1]), reverse=True
-    )
-    return event_candidates[0][0]
-
-
-for filename in file_list:
-    full_path = os.path.join(test_folder, filename)
 
     # Skip if it's a folder
     if os.path.isdir(full_path):
         continue
 
+    # Total timer starts per file
+    _total_t0 = time.perf_counter()
     print(f"\nProcessing: {filename}")
 
     # Check if it's an image file (excluding BMP which is handled in another cell)
     if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
         try:
-            # Identify OCR engine/device for logging
-            _ocr_engine = "EasyOCR"
-            _ocr_device = "MPS" if mps_available else "CPU"
-
-            # OCR with device fallback (handles MPS -> CPU automatically on error)
+            # Process non-BMP image formats with enhanced parameters
             _ocr_t0 = time.perf_counter()
-            results = readtext_with_fallback(
-                reader,
-                full_path,
-                detail=1,
-                paragraph=False,
-                text_threshold=0.2,
-                low_text=0.1,
-                link_threshold=0.4,
-                mag_ratio=1.5,
-            )
-            _ocr_time_sec = time.perf_counter() - _ocr_t0
+            _tmp_out = io.StringIO()
+            with contextlib.redirect_stdout(_tmp_out), contextlib.redirect_stderr(
+                _tmp_out
+            ):
+                results = reader.readtext(
+                    full_path,
+                    detail=1,
+                    paragraph=False,
+                    text_threshold=0.2,
+                    low_text=0.1,
+                    link_threshold=0.4,
+                    mag_ratio=1.5,
+                )
+            ocr_time_sec = time.perf_counter() - _ocr_t0
+            # OCR-only timing (Cell 5 / EasyOCR device-aware)
+            _device = OCR_DEVICE
+            log_ocr_time("cell5", "EasyOCR", _device, full_path, ocr_time_sec)
 
-            # Place file in a DataFrame (kept for consistency/debugging)
+            # Place file in a DataFrame
             img_id = filename.split("/")[-1].split(".")[0]
             box_dataframe = pd.DataFrame(
                 results, columns=["bbox", "text", "confidence"]
@@ -3891,7 +3045,7 @@ for filename in file_list:
             print("\n--- OCR-Focused Serial Number Detection ---")
 
             # Use OCR-focused extraction
-            serial_num = extract_serial_with_improved_ocr(results, full_path)
+            serial_num = extract_serial(results, full_path)
 
             if not serial_num:
                 print("No serial number found with OCR-focused extraction.")
@@ -3950,42 +3104,42 @@ for filename in file_list:
 
             # Zipcode extraction
             zipcode_pat = r"\b\d{5}(-\d{4})?\b"
-            if results:
-                # Get image dimensions for targeted zipcode search
-                all_y_coords = [point[1] for bbox, _, _ in results for point in bbox]
-                image_height = max(all_y_coords) if all_y_coords else 0
 
-                # Target middle region for zipcodes
-                top_boundary = image_height * 0.25
-                bottom_boundary = image_height * 0.50
+            # Get image dimensions for targeted zipcode search
+            all_y_coords = [point[1] for bbox, _, _ in results for point in bbox]
+            image_height = max(all_y_coords) if all_y_coords else 0
 
-                # Find zipcode candidates
-                candidates = []
-                for bbox, text, confidence in results:
-                    text = text.strip()
-                    if re.match(zipcode_pat, text):
-                        # Get text position
-                        top_y = min([point[1] for point in bbox])
-                        bottom_y = max([point[1] for point in bbox])
-                        text_center_y = (top_y + bottom_y) / 2
+            # Target middle region for zipcodes
+            top_boundary = image_height * 0.25
+            bottom_boundary = image_height * 0.50
 
-                        # Check if in target region
-                        if top_boundary <= text_center_y <= bottom_boundary:
-                            candidates.append((text, confidence, text_center_y))
+            # Find zipcode candidates
+            candidates = []
+            for bbox, text, confidence in results:
+                text = text.strip()
+                if re.match(zipcode_pat, text):
+                    # Get text position
+                    top_y = min([point[1] for point in bbox])
+                    bottom_y = max([point[1] for point in bbox])
+                    text_center_y = (top_y + bottom_y) / 2
 
-                if candidates:
-                    # Return the candidate with highest confidence
-                    best_candidate = max(candidates, key=lambda x: x[1])
-                    zipcode = best_candidate[0]
-                    matches += 1
+                    # Check if in target region
+                    if top_boundary <= text_center_y <= bottom_boundary:
+                        candidates.append((text, confidence))
+
+            if candidates:
+                # Return the candidate with highest confidence
+                best_candidate = max(candidates, key=lambda x: x[1])
+                zipcode = best_candidate[0]
+                matches += 1
 
             # Get city and state information from zipcode
             if zipcode:
                 try:
-                    end = zipcodes.matching(str(zipcode))
-                    if end:
-                        city = end[0]["city"]
-                        state = end[0]["state"]
+                    location = zipcodes.matching(str(zipcode))
+                    if location:
+                        city = location[0]["city"]
+                        state = location[0]["state"]
                         matches += 2
                 except Exception as e:
                     print(f"Error looking up zipcode {zipcode}: {e}")
@@ -4015,46 +3169,59 @@ for filename in file_list:
             except Exception:
                 top_candidates = ""
 
-            # Compute total time
-            _total_time_sec = time.perf_counter() - _total_t0
+            csv_results.append(
+                {
+                    "serial_number": serial_num or "Missing",
+                    "event_type": event_type or "Missing",
+                    "event_date": date or "Missing",
+                    "associated_name": name or "Missing",
+                    "associated_address": (
+                        str(complete_address) if complete_address else "Missing"
+                    ),
+                    "source_file": relative_path,
+                    "file_created": metadata["file_creation_date"],
+                    "file_modified": metadata["file_modification_date"],
+                    # Instrumentation
+                    "ocr_engine": "EasyOCR",
+                    "ocr_device": OCR_DEVICE,
+                    "ocr_time_sec": (
+                        round(ocr_time_sec, 4) if "ocr_time_sec" in locals() else None
+                    ),
+                    "total_time_sec": round(time.perf_counter() - _total_t0, 4),
+                    "top_serial_candidates": top_candidates,
+                }
+            )
 
-            # Create CSV record with standardized columns, using 'Missing' for empty values
-            csv_record = {
-                "serial_number": str(serial_num) if serial_num else "Missing",
-                "event_type": str(event_type) if event_type else "Missing",
-                "event_date": str(date) if date else "Missing",
-                "associated_name": str(name) if name else "Missing",
-                "associated_address": (
-                    str(complete_address) if complete_address else "Missing"
-                ),
-                "source_file": relative_path,
-                "file_created": metadata["file_creation_date"],
-                "file_modified": metadata["file_modification_date"],
-                # Instrumentation fields
-                "ocr_engine": _ocr_engine,
-                "ocr_device": _ocr_device,
-                "ocr_time_sec": round(_ocr_time_sec, 6),
-                "total_time_sec": round(_total_time_sec, 6),
-                "top_serial_candidates": top_candidates,
-            }
+            # Legacy df1 append
+            df1 = pd.concat(
+                [
+                    df1,
+                    pd.DataFrame(
+                        [
+                            {
+                                "serial_number": serial_num,
+                                "name": name,
+                                "address": addy,
+                                "date": date,
+                                "zipcode": zipcode,
+                                "city": city,
+                                "state": state,
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
 
-            csv_results.append(csv_record)
+            if serial_num:
+                sel = df1["serial_number"] == serial_num
+                df1.loc[sel, "filename"] = metadata["filename"]
+                df1.loc[sel, "file_creation_date"] = metadata["file_creation_date"]
+                df1.loc[sel, "file_modification_date"] = metadata[
+                    "file_modification_date"
+                ]
+                df1.loc[sel, "file_location"] = metadata["file_location"]
 
-            # Add extracted information to df1 (legacy format)
-            new_row = {
-                "serial_number": str(serial_num) if serial_num else None,
-                "name": str(name) if name else None,
-                "address": str(addy) if addy else None,
-                "date": str(date) if date else None,
-                "zipcode": str(zipcode) if zipcode else None,
-                "city": str(city) if city else None,
-                "state": str(state) if state else None,
-            }
-
-            # Add the row
-            df1 = pd.concat([df1, pd.DataFrame([new_row])], ignore_index=True)
-
-            # Summary
             print("Summary...")
             print("Serial Number:", serial_num if serial_num else "Missing")
             print("Event Type:", event_type if event_type else "Missing")
@@ -4095,1660 +3262,15 @@ for filename in file_list:
         print(f"BMP file (handled in separate cell): {filename}")
 
     elif filename.lower().endswith(".pdf"):
-        print(f"PDF file (would need special handling): {filename}")
-
+        ocr_log(f"PDF file (would need special handling): {filename}")
     else:
         print(f"Skipping non-image file: {filename}")
 
-print(f"\nProcessing complete!")
-
-# Create and save CSV results to reports folder
-if csv_results:
-    results_df = pd.DataFrame(csv_results)
-    print("\n" + "=" * 80)
-    print("NON-BMP IMAGE EXTRACTION RESULTS (CSV FORMAT)")
-    print("=" * 80)
-    print(results_df.to_csv(index=False))
-
-    # Create reports folder if it doesn't exist
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-
-    # Save to file in reports folder
-    output_file = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    results_df.to_csv(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
-else:
-    print("\nNo results to save.")
+print("\nProcessing complete!")
 
 
 # %%
-# CELL 10: Process non-BMP image files with PaddleOCR (CPU-only) and CSV output
-
-# Safe imports (ok to re-import in a notebook cell)
-import os
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import re
-import zipcodes
-
-# PaddleOCR (CPU-only)
-import paddle
-from paddleocr import PaddleOCR
-
-# Add metadata columns to df1
-df1["filename"] = df1["filename"].astype(str)
-df1["file_creation_date"] = df1["file_creation_date"].astype(str)
-df1["file_modification_date"] = df1["file_modification_date"].astype(str)
-df1["file_location"] = df1["file_location"].astype(str)
-
-# Path to 'test' folder
-test_folder = os.path.join(os.getcwd(), "test")
-
-# Force CPU (current macOS wheels do not support 'mps')
-try:
-    paddle.set_device("cpu")
-    print("Paddle set to CPU (MPS not available in this build).")
-except Exception as e:
-    print(f"Falling back to CPU due to error: {e}")
-    paddle.set_device("cpu")
-
-# Build PaddleOCR reader (avoid downscaling: large det_max_side_len)
-ocr_reader = PaddleOCR(
-    use_angle_cls=True,
-    lang="en",
-    det_max_side_len=4096,  # prevent unwanted downscaling on high-res images
-    show_log=False,
-)
-
-# Get all files in 'test' folder (we'll still skip BMPs in the loop)
-file_list = os.listdir(test_folder)
-
-# Initialize CSV results list
-csv_results = []
-
-print(f"Found {len(file_list)} files in test folder")
-
-
-def normalize_paddle_results(paddle_result):
-    """
-    Convert PaddleOCR result to a flat list of (bbox, text, confidence) like EasyOCR.
-    Paddle format (for one image) is typically:
-      [ [ [points, (text, conf)], [points, (text, conf)], ... ] ]
-    or already a single list depending on version.
-    """
-    flat = []
-    if not paddle_result:
-        return flat
-
-    # Handle both nested [list] and already-flat list cases
-    if (
-        isinstance(paddle_result, list)
-        and len(paddle_result) > 0
-        and isinstance(paddle_result[0], list)
-        and len(paddle_result[0]) > 0
-        and isinstance(paddle_result[0][0], (list, tuple))
-        and len(paddle_result[0][0]) == 2
-    ):
-        candidates = paddle_result[0]
-    else:
-        candidates = paddle_result
-
-    for item in candidates:
-        # item is [points, (text, conf)]
-        try:
-            points, tc = item
-            text, conf = tc
-            # Normalize bbox as list of 4 points [[x1,y1],...]
-            bbox = points
-            flat.append((bbox, str(text), float(conf)))
-        except Exception:
-            # Be resilient if structure varies
-            continue
-    return flat
-
-
-def paddle_readtext_cpu(image_or_path, **kwargs):
-    """
-    CPU-only OCR call wrapper (kept as a function for consistency).
-    """
-    return ocr_reader.ocr(image_or_path, **kwargs)
-
-
-def extract_serial_with_improved_ocr(paddle_like_results, full_path):
-    """Extract serial number focusing on OCR accuracy improvements"""
-
-    def preprocess_image_for_ocr(image_path):
-        """Apply image preprocessing to improve OCR accuracy"""
-        import cv2
-        import numpy as np
-
-        # Load image
-        img = cv2.imread(image_path)
-        if img is None:
-            return None
-
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Apply different preprocessing techniques
-        preprocessed_images = []
-
-        # Original grayscale
-        preprocessed_images.append(("original_gray", gray))
-
-        # Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        preprocessed_images.append(("blurred", blurred))
-
-        # Sharpen
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(gray, -1, kernel)
-        preprocessed_images.append(("sharpened", sharpened))
-
-        # Fast denoising (non-local means)
-        try:
-            denoised = cv2.fastNlMeansDenoising(
-                gray, None, h=10, templateWindowSize=7, searchWindowSize=21
-            )
-            preprocessed_images.append(("denoised", denoised))
-        except Exception:
-            # If OpenCV build lacks this, skip gracefully
-            pass
-
-        # Adaptive threshold
-        adaptive = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        preprocessed_images.append(("adaptive_thresh", adaptive))
-
-        # Morphological operations to clean up
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
-        preprocessed_images.append(("morphological", morph))
-
-        return preprocessed_images
-
-    def run_multiple_ocr_passes(image_path):
-        """Run OCR with different parameters and preprocessing using PaddleOCR"""
-        all_candidates = []
-
-        import cv2
-        import numpy as np
-
-        # Helper: rotate an image (np.ndarray) by angle around center
-        def rotate_ndarray(img_nd, angle):
-            try:
-                (h, w) = img_nd.shape[:2]
-                center = (w / 2, h / 2)
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                rotated = cv2.warpAffine(
-                    img_nd,
-                    M,
-                    (w, h),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REPLICATE,
-                )
-                return rotated
-            except Exception:
-                return img_nd
-
-        # Standard OCR (on original) with rotations
-        for angle in (0, 90, 180, 270):
-            try:
-                if angle == 0:
-                    base_raw = paddle_readtext_cpu(image_path, cls=True)
-                else:
-                    # Read and rotate original BGR image
-                    bgr = cv2.imread(image_path)
-                    if bgr is None:
-                        continue
-                    rotated_bgr = rotate_ndarray(bgr, angle)
-                    base_raw = paddle_readtext_cpu(rotated_bgr, cls=True)
-                base = normalize_paddle_results(base_raw)
-                for bbox, text, confidence in base:
-                    if text.strip() and confidence > 0.3:
-                        all_candidates.append(
-                            {
-                                "text": text.strip(),
-                                "confidence": confidence,
-                                "source": f"standard_ocr_rot{angle}",
-                                "bbox": bbox,
-                            }
-                        )
-            except Exception as e:
-                print(f"Error during standard OCR rotation {angle}: {e}")
-
-        # Try different preprocessing
-        preprocessed_images = preprocess_image_for_ocr(image_path)
-        if preprocessed_images:
-            for prep_name, prep_img in preprocessed_images:
-                try:
-                    # PaddleOCR accepts np.ndarray as input; include rotations
-                    for angle in (0, 90, 180, 270):
-                        rotated = (
-                            rotate_ndarray(prep_img, angle) if angle != 0 else prep_img
-                        )
-                        prep_raw = paddle_readtext_cpu(rotated, cls=True)
-                        prep_results = normalize_paddle_results(prep_raw)
-
-                        for bbox, text, confidence in prep_results:
-                            if (
-                                text.strip() and confidence > 0.2
-                            ):  # Lower threshold for preprocessed
-                                all_candidates.append(
-                                    {
-                                        "text": text.strip(),
-                                        "confidence": confidence
-                                        * 0.9,  # Slight penalty for preprocessed
-                                        "source": f"preprocessed_{prep_name}_rot{angle}",
-                                        "bbox": bbox,
-                                    }
-                                )
-                except Exception as e:
-                    print(f"Error with {prep_name} preprocessing: {e}")
-
-        return all_candidates
-
-    def find_potential_serials(candidates):
-        """Find potential serial numbers from all OCR candidates"""
-        potential_serials = []
-
-        # Common words that are clearly NOT serial numbers
-        non_serial_words = {
-            "date",
-            "city",
-            "state",
-            "name",
-            "address",
-            "phone",
-            "email",
-            "zip",
-            "code",
-            "serial",
-            "number",
-            "model",
-            "make",
-            "caliber",
-            "type",
-            "manufacturer",
-            "license",
-            "permit",
-            "registration",
-            "form",
-            "page",
-            "section",
-            "dallas",
-            "texas",
-            "california",
-            "florida",
-            "new",
-            "york",
-            "smith",
-            "wesson",
-            "colt",
-            "ruger",
-            "glock",
-            "sig",
-            "sauer",
-            "the",
-            "and",
-            "for",
-            "with",
-            "this",
-            "that",
-            "from",
-            "have",
-            "been",
-            "firearm",
-            "pistol",
-            "rifle",
-            "gun",
-            "weapon",
-            "barrel",
-            "frame",
-            "slide",
-        }
-
-        for candidate in candidates:
-            text = candidate["text"]
-            confidence = candidate["confidence"]
-            source = candidate["source"]
-
-            # Remove spaces and special characters
-            cleaned = "".join(c for c in text if c.isalnum())
-
-            # Skip if it's clearly not a serial number
-            if cleaned.lower() in non_serial_words:
-                continue
-
-            # Skip if it's all letters and looks like a common word (likely not a serial)
-            if cleaned.isalpha() and len(cleaned) <= 8:
-                continue
-
-            # Check if it could be a serial (basic length check)
-            if 4 <= len(cleaned) <= 15 and cleaned.isalnum():
-                # Additional check: prefer mixed alphanumeric or longer sequences
-                has_letters = any(c.isalpha() for c in cleaned)
-                has_numbers = any(c.isdigit() for c in cleaned)
-
-                # Boost confidence for mixed alphanumeric (more likely to be serials)
-                if has_letters and has_numbers:
-                    confidence *= 1.2
-                elif len(cleaned) >= 6:  # Or longer sequences
-                    confidence *= 1.1
-
-                potential_serials.append(
-                    {
-                        "serial": cleaned,
-                        "original_text": text,
-                        "confidence": confidence,
-                        "source": source,
-                        "bbox": candidate["bbox"],
-                    }
-                )
-
-            # Also try spaced character reconstruction for this candidate
-            if " " in text and len(text.split()) >= 3:
-                parts = [p.strip() for p in text.split() if p.strip().isalnum()]
-                if len(parts) >= 3:
-                    reconstructed = "".join(parts)
-                    if (
-                        4 <= len(reconstructed) <= 15
-                        and reconstructed.isalnum()
-                        and reconstructed.lower() not in non_serial_words
-                    ):
-                        potential_serials.append(
-                            {
-                                "serial": reconstructed,
-                                "original_text": text,
-                                "confidence": confidence * 0.8,
-                                "source": f"{source}_reconstructed",
-                                "bbox": candidate["bbox"],
-                            }
-                        )
-
-        return potential_serials
-
-    # Run multiple OCR passes
-    print("Running multiple OCR passes for improved accuracy...")
-    all_candidates = run_multiple_ocr_passes(full_path)
-
-    # Find potential serials
-    potential_serials = find_potential_serials(all_candidates)
-
-    # Remove duplicates and sort by confidence
-    unique_serials = {}
-    for serial_info in potential_serials:
-        serial = serial_info["serial"]
-        if (
-            serial not in unique_serials
-            or serial_info["confidence"] > unique_serials[serial]["confidence"]
-        ):
-            unique_serials[serial] = serial_info
-
-    # Sort by confidence
-    sorted_serials = sorted(
-        unique_serials.values(), key=lambda x: x["confidence"], reverse=True
-    )
-
-    # Display top candidates for transparency
-    print(f"\nSerial number candidates found:")
-    if sorted_serials:
-        for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
-            marker = "→ SELECTED" if i == 0 else "  "
-            print(
-                f"  {marker} '{serial_info['serial']}' (confidence: {serial_info['confidence']:.3f}) from {serial_info['source']}"
-            )
-            print(f"      Original text: '{serial_info['original_text']}'")
-        return sorted_serials[0]["serial"]
-    else:
-        print("  No potential serial numbers found")
-        return None
-
-
-def extract_event_type_semantic(results):
-    """
-    Mirror BMP-style event detection with semantic priorities.
-    Returns best event_type or None.
-    """
-    import re
-
-    event_candidates = []
-
-    # Excluded administrative words
-    excluded_words = {
-        "atf",
-        "bureau",
-        "federal",
-        "department",
-        "justice",
-        "alcohol",
-        "tobacco",
-        "firearms",
-        "explosives",
-        "form",
-        "section",
-        "page",
-        "number",
-        "code",
-        "licensee",
-        "information",
-        "details",
-        "description",
-        "brief",
-        "name",
-        "address",
-        "telephone",
-        "date",
-        "time",
-        "signature",
-        "certification",
-    }
-
-    # Priority 1: Document purpose indicators
-    purpose_patterns = [
-        (
-            r"(Theft|Loss|Stolen|Missing|Burglary|Robbery|Larceny).*?Report",
-            "Theft/Loss",
-        ),
-        (r"Inventory\s+(Theft|Loss)", "Theft/Loss"),
-        (
-            r"(Purchase|Sale|Transfer|Registration|Acquisition|Disposition).*?Report",
-            None,
-        ),
-    ]
-
-    for pattern, fixed_event in purpose_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.4:
-                event = fixed_event if fixed_event else m.group(1).title()
-                event_candidates.append((event, conf + 1.0, "document_purpose", text))
-
-    # Priority 2: Specific incident/crime types
-    incident_types = {
-        "burglary": "Burglary",
-        "robbery": "Robbery",
-        "larceny": "Larceny",
-        "theft": "Theft",
-        "stolen": "Theft",
-        "missing": "Missing",
-        "lost": "Loss",
-    }
-    for _, text, conf in results:
-        text_clean = text.lower().strip()
-        if text_clean in incident_types and conf > 0.5:
-            event_candidates.append(
-                (incident_types[text_clean], conf + 0.8, "incident_type", text)
-            )
-
-    # Priority 3: Action descriptions
-    action_patterns = [
-        (r"was\s+(stolen|taken|missing|lost)", None),
-        (r"were\s+(stolen|taken|missing|lost)", None),
-        (r"firearm\s+was\s+(\w+)", None),
-        (r"gun\s+was\s+(\w+)", None),
-    ]
-    for pattern, _ in action_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.6:
-                action = m.group(1).lower()
-                if action in incident_types:
-                    event_candidates.append(
-                        (incident_types[action], conf + 0.6, "action_description", text)
-                    )
-
-    # Priority 4: Section headers
-    section_patterns = [
-        (r"(Theft|Loss|Stolen|Missing)\s+Information", None),
-        (r"(Purchase|Sale|Transfer)\s+Information", None),
-    ]
-    for pattern, _ in section_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.6:
-                event = m.group(1).title()
-                if event.lower() not in excluded_words:
-                    event_candidates.append((event, conf + 0.4, "section_header", text))
-
-    # Priority 5: Meaningful single words
-    for _, text, conf in results:
-        t = text.strip()
-        if len(t.split()) == 1 and len(t) > 3 and conf > 0.7 and t.isalpha():
-            low = t.lower()
-            if low not in excluded_words and low in incident_types:
-                event_candidates.append(
-                    (incident_types[low], conf + 0.2, "meaningful_word", text)
-                )
-
-    if not event_candidates:
-        return None
-
-    priority_order = {
-        "document_purpose": 5,
-        "incident_type": 4,
-        "action_description": 3,
-        "section_header": 2,
-        "meaningful_word": 1,
-    }
-    event_candidates.sort(
-        key=lambda x: (priority_order.get(x[2], 0), x[1]), reverse=True
-    )
-    return event_candidates[0][0]
-
-
-for filename in file_list:
-    full_path = os.path.join(test_folder, filename)
-
-    # Skip if it's a folder
-    if os.path.isdir(full_path):
-        continue
-
-    print(f"\nProcessing: {filename}")
-
-    # Check if it's an image file (excluding BMP which is handled in another cell)
-    if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
-        try:
-            # Identify OCR engine/device and time the OCR call
-            _ocr_engine = "PaddleOCR"
-            _ocr_device = "CPU"
-            _ocr_t0 = time.perf_counter()
-            # PaddleOCR (CPU-only)
-            paddle_raw = paddle_readtext_cpu(full_path, cls=True)
-            _ocr_time_sec = time.perf_counter() - _ocr_t0
-            # OCR-only timing (Cell 10 / Paddle CPU)
-            log_ocr_time(
-                "cell10",
-                _ocr_engine if "_ocr_engine" in locals() else "PaddleOCR",
-                _ocr_device if "_ocr_device" in locals() else "CPU",
-                full_path,
-                _ocr_time_sec,
-            )
-            results = normalize_paddle_results(
-                paddle_raw
-            )  # [(bbox, text, confidence), ...]
-
-            # Place file in a DataFrame (kept for consistency/debugging)
-            img_id = filename.split("/")[-1].split(".")[0]
-            box_dataframe = pd.DataFrame(
-                results, columns=["bbox", "text", "confidence"]
-            )
-            box_dataframe["img_id"] = img_id
-
-            # Read image for visualization
-            img = cv2.imread(full_path)
-
-            # Display image with detected text if loaded successfully
-            if img is not None and isinstance(img, np.ndarray):
-                for bbox, text, confidence in results:
-                    try:
-                        pts = np.array(bbox, np.int32)
-                        pts = pts.reshape((-1, 1, 2))
-                        cv2.polylines(
-                            img, [pts], isClosed=True, color=(0, 0, 255), thickness=2
-                        )
-                        x, y = pts[0][0]
-                        cv2.putText(
-                            img,
-                            text,
-                            (int(x), int(y) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 0, 255),
-                            2,
-                        )
-                    except Exception:
-                        # be resilient to unexpected bbox formats
-                        pass
-
-                # Display the image (disabled for performance)
-                try:
-                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    # plt.figure(figsize=(12, 8))
-                    # plt.imshow(img_rgb)
-                    # plt.axis("off")
-                    # plt.title(f"OCR Results for {filename}")
-                    # plt.show()
-                    pass
-                except Exception:
-                    print(f"Warning: Could not display image {filename}")
-
-            # OCR-focused serial extraction
-            print("\n--- OCR-Focused Serial Number Detection ---")
-
-            # Use OCR-focused extraction (reuses PaddleOCR under the hood)
-            serial_num = extract_serial_with_improved_ocr(results, full_path)
-
-            if not serial_num:
-                print("No serial number found with OCR-focused extraction.")
-                # Show all detected text for manual inspection
-                if results:
-                    print("All OCR detections:")
-                    for i, (bbox, text, confidence) in enumerate(results):
-                        print(f"  {i+1}. '{text}' (confidence: {confidence:.4f})")
-
-            print("--- End OCR-Focused Serial Number Detection ---")
-
-            # Extract other metadata
-            matches = 0
-
-            # Initialize variables to avoid NameError
-            name = None
-            addy = None
-            date = None
-            zipcode = None
-            city = None
-            state = None
-
-            # Name extraction
-            name_pat = r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b"
-            for bbox, text, confidence in results:
-                match = re.search(name_pat, text)
-                if match and confidence > 0.8:
-                    name = match.group()
-                    matches += 1
-                    break
-
-            # Address extraction
-            address_pat = r"\b\d{1,5}\s[A-Z][a-z]+\s[A-Z][a-z]+\b"
-            for bbox, text, confidence in results:
-                match = re.search(address_pat, text)
-                if match:
-                    addy = match.group()
-                    matches += 1
-                    break
-
-            # Date extraction (support / and -)
-            date_pat = r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
-            for bbox, text, confidence in results:
-                match = re.search(date_pat, text)
-                if match:
-                    date = match.group()
-                    matches += 1
-                    break
-
-            # Event type extraction (semantic - mirrored from BMP logic)
-            event_type = extract_event_type_semantic(results)
-            if event_type:
-                matches += 1
-            else:
-                event_type = None
-
-            # Zipcode extraction
-            zipcode_pat = r"\b\d{5}(-\d{4})?\b"
-            if results:
-                # Get image dimensions for targeted zipcode search
-                try:
-                    all_y_coords = [
-                        point[1] for bbox, _, _ in results for point in bbox
-                    ]
-                    image_height = max(all_y_coords) if all_y_coords else 0
-                except Exception:
-                    image_height = 0
-
-                # Target middle region for zipcodes
-                top_boundary = image_height * 0.25
-                bottom_boundary = image_height * 0.50
-
-                # Find zipcode candidates
-                candidates = []
-                for bbox, text, confidence in results:
-                    t = text.strip()
-                    if re.match(zipcode_pat, t):
-                        try:
-                            top_y = min([point[1] for point in bbox])
-                            bottom_y = max([point[1] for point in bbox])
-                            text_center_y = (top_y + bottom_y) / 2
-                        except Exception:
-                            text_center_y = 0
-
-                        if top_boundary <= text_center_y <= bottom_boundary:
-                            candidates.append((t, confidence, text_center_y))
-
-                if candidates:
-                    # Return the candidate with highest confidence
-                    best_candidate = max(candidates, key=lambda x: x[1])
-                    zipcode = best_candidate[0]
-                    matches += 1
-
-            # Get city and state information from zipcode
-            if zipcode:
-                try:
-                    end = zipcodes.matching(str(zipcode))
-                    if end:
-                        city = end[0]["city"]
-                        state = end[0]["state"]
-                        matches += 2
-                except Exception as e:
-                    print(f"Error looking up zipcode {zipcode}: {e}")
-
-            # Get file metadata
-            metadata = get_file_metadata(full_path)
-
-            # Create relative path for source_file
-            relative_path = os.path.join("test", filename)
-
-            # Construct complete address
-            complete_address = ""
-            if addy:
-                complete_address = addy
-                if city and state:
-                    complete_address += f", {city}, {state}"
-                    if zipcode:
-                        complete_address += f" {zipcode}"
-                elif zipcode:
-                    complete_address += f" {zipcode}"
-
-            # Build top-5 candidates string from global
-            try:
-                top_candidates = "; ".join(
-                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
-                )
-            except Exception:
-                top_candidates = ""
-
-            # Compute total time
-            _total_time_sec = time.perf_counter() - _total_t0
-
-            # Create CSV record with standardized columns, using 'Missing' for empty values
-            csv_record = {
-                "serial_number": str(serial_num) if serial_num else "Missing",
-                "event_type": str(event_type) if event_type else "Missing",
-                "event_date": str(date) if date else "Missing",
-                "associated_name": str(name) if name else "Missing",
-                "associated_address": (
-                    str(complete_address) if complete_address else "Missing"
-                ),
-                "source_file": relative_path,
-                "file_created": metadata["file_creation_date"],
-                "file_modified": metadata["file_modification_date"],
-                # Instrumentation fields
-                "ocr_engine": _ocr_engine,
-                "ocr_device": _ocr_device,
-                "ocr_time_sec": round(_ocr_time_sec, 6),
-                "total_time_sec": round(_total_time_sec, 6),
-                "top_serial_candidates": top_candidates,
-            }
-
-            csv_results.append(csv_record)
-
-            # Add extracted information to df1 (legacy format)
-            new_row = {
-                "serial_number": str(serial_num) if serial_num else None,
-                "name": str(name) if name else None,
-                "address": str(addy) if addy else None,
-                "date": str(date) if date else None,
-                "zipcode": str(zipcode) if zipcode else None,
-                "city": str(city) if city else None,
-                "state": str(state) if state else None,
-            }
-
-            # Add the row
-            df1 = pd.concat([df1, pd.DataFrame([new_row])], ignore_index=True)
-
-            # Summary
-            print("Summary...")
-            print("Serial Number:", serial_num if serial_num else "Missing")
-            print("Event Type:", event_type if event_type else "Missing")
-            print("Name:", name if name else "Missing")
-            print("Address:", complete_address if complete_address else "Missing")
-            print("Date:", date if date else "Missing")
-            print("Zipcode:", zipcode if zipcode else "Missing")
-            print("City:", city if city else "Missing")
-            print("State:", state if state else "Missing")
-            print("Matches found:", matches, "/ 7")
-
-            print("File Metadata:")
-            for key, value in metadata.items():
-                print(f"  {key}: {value}")
-
-            # Add metadata to df1 (legacy format)
-            if serial_num:
-                df1.loc[df1["serial_number"] == str(serial_num), "filename"] = metadata[
-                    "filename"
-                ]
-                df1.loc[
-                    df1["serial_number"] == str(serial_num), "file_creation_date"
-                ] = metadata["file_creation_date"]
-                df1.loc[
-                    df1["serial_number"] == str(serial_num), "file_modification_date"
-                ] = metadata["file_modification_date"]
-                df1.loc[df1["serial_number"] == str(serial_num), "file_location"] = (
-                    metadata["file_location"]
-                )
-
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    elif filename.lower().endswith(".bmp"):
-        print(f"BMP file (handled in separate cell): {filename}")
-
-    elif filename.lower().endswith(".pdf"):
-        print(f"PDF file (would need special handling): {filename}")
-
-    else:
-        print(f"Skipping non-image file: {filename}")
-
-print(f"\nProcessing complete!")
-
-# Create and save CSV results to reports folder
-if csv_results:
-    results_df = pd.DataFrame(csv_results)
-    print("\n" + "=" * 80)
-    print("NON-BMP IMAGE EXTRACTION RESULTS (CSV FORMAT)")
-    print("=" * 80)
-    print(results_df.to_csv(index=False))
-
-    # Create reports folder if it doesn't exist
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-
-    # Save to file in reports folder
-    output_file = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    results_df.to_csv(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
-else:
-    print("\nNo results to save.")
-
-
-# %%
-# CELL 11: Process non-BMP image files with PaddleOCR (CPU-only) and CSV output
-
-# Safe imports (ok to re-import in a notebook cell)
-import os
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import re
-import zipcodes
-
-# PaddleOCR (CPU-only)
-try:
-    import paddle
-    from paddleocr import PaddleOCR
-except ModuleNotFoundError as e:
-    raise ModuleNotFoundError(
-        "Paddle not available in this kernel. Install with:\n"
-        "  pip install paddlepaddle==2.6.1 'paddleocr>=2.7'\n"
-        "or switch to your Python 3.11 env where Paddle is installed."
-    ) from e
-
-# Add metadata columns to df1
-df1["filename"] = df1["filename"].astype(str)
-df1["file_creation_date"] = df1["file_creation_date"].astype(str)
-df1["file_modification_date"] = df1["file_modification_date"].astype(str)
-df1["file_location"] = df1["file_location"].astype(str)
-
-# Path to 'test' folder
-test_folder = os.path.join(os.getcwd(), "test")
-
-# Force CPU (current macOS wheels do not support 'mps')
-try:
-    paddle.set_device("cpu")
-    print("Paddle set to CPU (MPS not available in this build).")
-except Exception as e:
-    print(f"Falling back to CPU due to error: {e}")
-    paddle.set_device("cpu")
-
-# Build PaddleOCR reader (avoid downscaling: large det_max_side_len)
-ocr_reader = PaddleOCR(
-    use_angle_cls=True,
-    lang="en",
-    det_max_side_len=4096,  # prevent unwanted downscaling on high-res images
-    show_log=False,
-)
-
-# Get all files in 'test' folder (we'll still skip BMPs in the loop)
-file_list = os.listdir(test_folder)
-
-# Initialize CSV results list
-csv_results = []
-
-print(f"Found {len(file_list)} files in test folder")
-
-
-def normalize_paddle_results(paddle_result):
-    """
-    Convert PaddleOCR result to a flat list of (bbox, text, confidence) like EasyOCR.
-    Paddle format (for one image) is typically:
-      [ [ [points, (text, conf)], [points, (text, conf)], ... ] ]
-    or already a single list depending on version.
-    """
-    flat = []
-    if not paddle_result:
-        return flat
-
-    # Handle both nested [list] and already-flat list cases
-    if (
-        isinstance(paddle_result, list)
-        and len(paddle_result) > 0
-        and isinstance(paddle_result[0], list)
-        and len(paddle_result[0]) > 0
-        and isinstance(paddle_result[0][0], (list, tuple))
-        and len(paddle_result[0][0]) == 2
-    ):
-        candidates = paddle_result[0]
-    else:
-        candidates = paddle_result
-
-    for item in candidates:
-        # item is [points, (text, conf)]
-        try:
-            points, tc = item
-            text, conf = tc
-            # Normalize bbox as list of 4 points [[x1,y1],...]
-            bbox = points
-            flat.append((bbox, str(text), float(conf)))
-        except Exception:
-            # Be resilient if structure varies
-            continue
-    return flat
-
-
-def paddle_readtext_cpu(image_or_path, **kwargs):
-    """
-    CPU-only OCR call wrapper (kept as a function for consistency).
-    """
-    return ocr_reader.ocr(image_or_path, **kwargs)
-
-
-def extract_serial_with_improved_ocr(paddle_like_results, full_path):
-    """Extract serial number focusing on OCR accuracy improvements"""
-
-    def preprocess_image_for_ocr(image_path):
-        """Apply image preprocessing to improve OCR accuracy"""
-        import cv2
-        import numpy as np
-
-        # Load image
-        img = cv2.imread(image_path)
-        if img is None:
-            return None
-
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Apply different preprocessing techniques
-        preprocessed_images = []
-
-        # Original grayscale
-        preprocessed_images.append(("original_gray", gray))
-
-        # Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        preprocessed_images.append(("blurred", blurred))
-
-        # Sharpen
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(gray, -1, kernel)
-        preprocessed_images.append(("sharpened", sharpened))
-
-        # Adaptive threshold
-        adaptive = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-        preprocessed_images.append(("adaptive_thresh", adaptive))
-
-        # Morphological operations to clean up
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        morph = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
-        preprocessed_images.append(("morphological", morph))
-
-        return preprocessed_images
-
-    def run_multiple_ocr_passes(image_path):
-        """Run OCR with different parameters and preprocessing using PaddleOCR"""
-        all_candidates = []
-
-        # Standard OCR (on original)
-        base_raw = paddle_readtext_cpu(image_path, cls=True)
-        base = normalize_paddle_results(base_raw)
-        for bbox, text, confidence in base:
-            if text.strip() and confidence > 0.3:
-                all_candidates.append(
-                    {
-                        "text": text.strip(),
-                        "confidence": confidence,
-                        "source": "standard_ocr",
-                        "bbox": bbox,
-                    }
-                )
-
-        # Try different preprocessing
-        preprocessed_images = preprocess_image_for_ocr(image_path)
-        if preprocessed_images:
-            for prep_name, prep_img in preprocessed_images:
-                try:
-                    # PaddleOCR accepts np.ndarray as input
-                    prep_raw = paddle_readtext_cpu(prep_img, cls=True)
-                    prep_results = normalize_paddle_results(prep_raw)
-
-                    for bbox, text, confidence in prep_results:
-                        if (
-                            text.strip() and confidence > 0.2
-                        ):  # Lower threshold for preprocessed
-                            all_candidates.append(
-                                {
-                                    "text": text.strip(),
-                                    "confidence": confidence
-                                    * 0.9,  # Slight penalty for preprocessed
-                                    "source": f"preprocessed_{prep_name}",
-                                    "bbox": bbox,
-                                }
-                            )
-                except Exception as e:
-                    print(f"Error with {prep_name} preprocessing: {e}")
-
-        return all_candidates
-
-    def find_potential_serials(candidates):
-        """Find potential serial numbers from all OCR candidates"""
-        potential_serials = []
-
-        # Common words that are clearly NOT serial numbers
-        non_serial_words = {
-            "date",
-            "city",
-            "state",
-            "name",
-            "address",
-            "phone",
-            "email",
-            "zip",
-            "code",
-            "serial",
-            "number",
-            "model",
-            "make",
-            "caliber",
-            "type",
-            "manufacturer",
-            "license",
-            "permit",
-            "registration",
-            "form",
-            "page",
-            "section",
-            "dallas",
-            "texas",
-            "california",
-            "florida",
-            "new",
-            "york",
-            "smith",
-            "wesson",
-            "colt",
-            "ruger",
-            "glock",
-            "sig",
-            "sauer",
-            "the",
-            "and",
-            "for",
-            "with",
-            "this",
-            "that",
-            "from",
-            "have",
-            "been",
-            "firearm",
-            "pistol",
-            "rifle",
-            "gun",
-            "weapon",
-            "barrel",
-            "frame",
-            "slide",
-        }
-
-        for candidate in candidates:
-            text = candidate["text"]
-            confidence = candidate["confidence"]
-            source = candidate["source"]
-
-            # Remove spaces and special characters
-            cleaned = "".join(c for c in text if c.isalnum())
-
-            # Skip if it's clearly not a serial number
-            if cleaned.lower() in non_serial_words:
-                continue
-
-            # Skip if it's all letters and looks like a common word (likely not a serial)
-            if cleaned.isalpha() and len(cleaned) <= 8:
-                continue
-
-            # Check if it could be a serial (basic length check)
-            if 4 <= len(cleaned) <= 15 and cleaned.isalnum():
-                # Additional check: prefer mixed alphanumeric or longer sequences
-                has_letters = any(c.isalpha() for c in cleaned)
-                has_numbers = any(c.isdigit() for c in cleaned)
-
-                # Boost confidence for mixed alphanumeric (more likely to be serials)
-                if has_letters and has_numbers:
-                    confidence *= 1.2
-                elif len(cleaned) >= 6:  # Or longer sequences
-                    confidence *= 1.1
-
-                potential_serials.append(
-                    {
-                        "serial": cleaned,
-                        "original_text": text,
-                        "confidence": confidence,
-                        "source": source,
-                        "bbox": candidate["bbox"],
-                    }
-                )
-
-            # Also try spaced character reconstruction for this candidate
-            if " " in text and len(text.split()) >= 3:
-                parts = [p.strip() for p in text.split() if p.strip().isalnum()]
-                if len(parts) >= 3:
-                    reconstructed = "".join(parts)
-                    if (
-                        4 <= len(reconstructed) <= 15
-                        and reconstructed.isalnum()
-                        and reconstructed.lower() not in non_serial_words
-                    ):
-                        potential_serials.append(
-                            {
-                                "serial": reconstructed,
-                                "original_text": text,
-                                "confidence": confidence * 0.8,
-                                "source": f"{source}_reconstructed",
-                                "bbox": candidate["bbox"],
-                            }
-                        )
-
-        return potential_serials
-
-    # Run multiple OCR passes
-    print("Running multiple OCR passes for improved accuracy...")
-    all_candidates = run_multiple_ocr_passes(full_path)
-
-    # Find potential serials
-    potential_serials = find_potential_serials(all_candidates)
-
-    # Remove duplicates and sort by confidence
-    unique_serials = {}
-    for serial_info in potential_serials:
-        serial = serial_info["serial"]
-        if (
-            serial not in unique_serials
-            or serial_info["confidence"] > unique_serials[serial]["confidence"]
-        ):
-            unique_serials[serial] = serial_info
-
-    # Sort by confidence
-    sorted_serials = sorted(
-        unique_serials.values(), key=lambda x: x["confidence"], reverse=True
-    )
-
-    # Display top candidates for transparency
-    print(f"\nSerial number candidates found:")
-    if sorted_serials:
-        for i, serial_info in enumerate(sorted_serials[:5]):  # Show top 5
-            marker = "→ SELECTED" if i == 0 else "  "
-            print(
-                f"  {marker} '{serial_info['serial']}' (confidence: {serial_info['confidence']:.3f}) from {serial_info['source']}"
-            )
-            print(f"      Original text: '{serial_info['original_text']}'")
-        return sorted_serials[0]["serial"]
-    else:
-        print("  No potential serial numbers found")
-        return None
-
-
-def extract_event_type_semantic(results):
-    """
-    Mirror BMP-style event detection with semantic priorities.
-    Returns best event_type or None.
-    """
-    import re
-
-    event_candidates = []
-
-    # Excluded administrative words
-    excluded_words = {
-        "atf",
-        "bureau",
-        "federal",
-        "department",
-        "justice",
-        "alcohol",
-        "tobacco",
-        "firearms",
-        "explosives",
-        "form",
-        "section",
-        "page",
-        "number",
-        "code",
-        "licensee",
-        "information",
-        "details",
-        "description",
-        "brief",
-        "name",
-        "address",
-        "telephone",
-        "date",
-        "time",
-        "signature",
-        "certification",
-    }
-
-    # Priority 1: Document purpose indicators
-    purpose_patterns = [
-        (
-            r"(Theft|Loss|Stolen|Missing|Burglary|Robbery|Larceny).*?Report",
-            "Theft/Loss",
-        ),
-        (r"Inventory\s+(Theft|Loss)", "Theft/Loss"),
-        (
-            r"(Purchase|Sale|Transfer|Registration|Acquisition|Disposition).*?Report",
-            None,
-        ),
-    ]
-
-    for pattern, fixed_event in purpose_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.4:
-                event = fixed_event if fixed_event else m.group(1).title()
-                event_candidates.append((event, conf + 1.0, "document_purpose", text))
-
-    # Priority 2: Specific incident/crime types
-    incident_types = {
-        "burglary": "Burglary",
-        "robbery": "Robbery",
-        "larceny": "Larceny",
-        "theft": "Theft",
-        "stolen": "Theft",
-        "missing": "Missing",
-        "lost": "Loss",
-    }
-    for _, text, conf in results:
-        text_clean = text.lower().strip()
-        if text_clean in incident_types and conf > 0.5:
-            event_candidates.append(
-                (incident_types[text_clean], conf + 0.8, "incident_type", text)
-            )
-
-    # Priority 3: Action descriptions
-    action_patterns = [
-        (r"was\s+(stolen|taken|missing|lost)", None),
-        (r"were\s+(stolen|taken|missing|lost)", None),
-        (r"firearm\s+was\s+(\w+)", None),
-        (r"gun\s+was\s+(\w+)", None),
-    ]
-    for pattern, _ in action_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.6:
-                action = m.group(1).lower()
-                if action in incident_types:
-                    event_candidates.append(
-                        (incident_types[action], conf + 0.6, "action_description", text)
-                    )
-
-    # Priority 4: Section headers
-    section_patterns = [
-        (r"(Theft|Loss|Stolen|Missing)\s+Information", None),
-        (r"(Purchase|Sale|Transfer)\s+Information", None),
-    ]
-    for pattern, _ in section_patterns:
-        for _, text, conf in results:
-            m = re.search(pattern, text, re.IGNORECASE)
-            if m and conf > 0.6:
-                event = m.group(1).title()
-                if event.lower() not in excluded_words:
-                    event_candidates.append((event, conf + 0.4, "section_header", text))
-
-    # Priority 5: Meaningful single words
-    for _, text, conf in results:
-        t = text.strip()
-        if len(t.split()) == 1 and len(t) > 3 and conf > 0.7 and t.isalpha():
-            low = t.lower()
-            if low not in excluded_words and low in incident_types:
-                event_candidates.append(
-                    (incident_types[low], conf + 0.2, "meaningful_word", text)
-                )
-
-    if not event_candidates:
-        return None
-
-    priority_order = {
-        "document_purpose": 5,
-        "incident_type": 4,
-        "action_description": 3,
-        "section_header": 2,
-        "meaningful_word": 1,
-    }
-    event_candidates.sort(
-        key=lambda x: (priority_order.get(x[2], 0), x[1]), reverse=True
-    )
-    return event_candidates[0][0]
-
-
-for filename in file_list:
-    full_path = os.path.join(test_folder, filename)
-
-    # Skip if it's a folder
-    if os.path.isdir(full_path):
-        continue
-
-    print(f"\nProcessing: {filename}")
-
-    # Check if it's an image file (excluding BMP which is handled in another cell)
-    if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff", ".gif")):
-        try:
-            # Identify OCR engine/device and time the OCR call
-            _ocr_engine = "PaddleOCR"
-            _ocr_device = "CPU"
-            _ocr_t0 = time.perf_counter()
-            # PaddleOCR (CPU-only)
-            paddle_raw = paddle_readtext_cpu(full_path, cls=True)
-            _ocr_time_sec = time.perf_counter() - _ocr_t0
-            results = normalize_paddle_results(
-                paddle_raw
-            )  # [(bbox, text, confidence), ...]
-
-            # Place file in a DataFrame (kept for consistency/debugging)
-            img_id = filename.split("/")[-1].split(".")[0]
-            box_dataframe = pd.DataFrame(
-                results, columns=["bbox", "text", "confidence"]
-            )
-            box_dataframe["img_id"] = img_id
-
-            # Read image for visualization
-            img = cv2.imread(full_path)
-
-            # Display image with detected text if loaded successfully
-            if img is not None and isinstance(img, np.ndarray):
-                for bbox, text, confidence in results:
-                    try:
-                        pts = np.array(bbox, np.int32)
-                        pts = pts.reshape((-1, 1, 2))
-                        cv2.polylines(
-                            img, [pts], isClosed=True, color=(0, 0, 255), thickness=2
-                        )
-                        x, y = pts[0][0]
-                        cv2.putText(
-                            img,
-                            text,
-                            (int(x), int(y) - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            1,
-                            (0, 0, 255),
-                            2,
-                        )
-                    except Exception:
-                        # be resilient to unexpected bbox formats
-                        pass
-
-                # Display the image (disabled for performance)
-                try:
-                    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    # plt.figure(figsize=(12, 8))
-                    # plt.imshow(img_rgb)
-                    # plt.axis("off")
-                    # plt.title(f"OCR Results for {filename}")
-                    # plt.show()
-                    pass
-                except Exception:
-                    print(f"Warning: Could not display image {filename}")
-
-            # OCR-focused serial extraction
-            print("\n--- OCR-Focused Serial Number Detection ---")
-
-            # Use OCR-focused extraction (reuses PaddleOCR under the hood)
-            serial_num = extract_serial_with_improved_ocr(results, full_path)
-
-            if not serial_num:
-                print("No serial number found with OCR-focused extraction.")
-                # Show all detected text for manual inspection
-                if results:
-                    print("All OCR detections:")
-                    for i, (bbox, text, confidence) in enumerate(results):
-                        print(f"  {i+1}. '{text}' (confidence: {confidence:.4f})")
-
-            print("--- End OCR-Focused Serial Number Detection ---")
-
-            # Extract other metadata
-            matches = 0
-
-            # Initialize variables to avoid NameError
-            name = None
-            addy = None
-            date = None
-            zipcode = None
-            city = None
-            state = None
-
-            # Name extraction
-            name_pat = r"\b[A-Z][a-z]+\s[A-Z][a-z]+\b"
-            for bbox, text, confidence in results:
-                match = re.search(name_pat, text)
-                if match and confidence > 0.8:
-                    name = match.group()
-                    matches += 1
-                    break
-
-            # Address extraction
-            address_pat = r"\b\d{1,5}\s[A-Z][a-z]+\s[A-Z][a-z]+\b"
-            for bbox, text, confidence in results:
-                match = re.search(address_pat, text)
-                if match:
-                    addy = match.group()
-                    matches += 1
-                    break
-
-            # Date extraction (support / and -)
-            date_pat = r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
-            for bbox, text, confidence in results:
-                match = re.search(date_pat, text)
-                if match:
-                    date = match.group()
-                    matches += 1
-                    break
-
-            # Event type extraction (semantic - mirrored from BMP logic)
-            event_type = extract_event_type_semantic(results)
-            if event_type:
-                matches += 1
-            else:
-                event_type = None
-
-            # Zipcode extraction
-            zipcode_pat = r"\b\d{5}(-\d{4})?\b"
-            if results:
-                # Get image dimensions for targeted zipcode search
-                try:
-                    all_y_coords = [
-                        point[1] for bbox, _, _ in results for point in bbox
-                    ]
-                    image_height = max(all_y_coords) if all_y_coords else 0
-                except Exception:
-                    image_height = 0
-
-                # Target middle region for zipcodes
-                top_boundary = image_height * 0.25
-                bottom_boundary = image_height * 0.50
-
-                # Find zipcode candidates
-                candidates = []
-                for bbox, text, confidence in results:
-                    t = text.strip()
-                    if re.match(zipcode_pat, t):
-                        try:
-                            top_y = min([point[1] for point in bbox])
-                            bottom_y = max([point[1] for point in bbox])
-                            text_center_y = (top_y + bottom_y) / 2
-                        except Exception:
-                            text_center_y = 0
-
-                        if top_boundary <= text_center_y <= bottom_boundary:
-                            candidates.append((t, confidence, text_center_y))
-
-                if candidates:
-                    # Return the candidate with highest confidence
-                    best_candidate = max(candidates, key=lambda x: x[1])
-                    zipcode = best_candidate[0]
-                    matches += 1
-
-            # Get city and state information from zipcode
-            if zipcode:
-                try:
-                    end = zipcodes.matching(str(zipcode))
-                    if end:
-                        city = end[0]["city"]
-                        state = end[0]["state"]
-                        matches += 2
-                except Exception as e:
-                    print(f"Error looking up zipcode {zipcode}: {e}")
-
-            # Get file metadata
-            metadata = get_file_metadata(full_path)
-
-            # Create relative path for source_file
-            relative_path = os.path.join("test", filename)
-
-            # Construct complete address
-            complete_address = ""
-            if addy:
-                complete_address = addy
-                if city and state:
-                    complete_address += f", {city}, {state}"
-                    if zipcode:
-                        complete_address += f" {zipcode}"
-                elif zipcode:
-                    complete_address += f" {zipcode}"
-
-            # Build top-5 candidates string from global
-            try:
-                top_serial_candidates = "; ".join(
-                    [f"{s}:{c:.3f}" for s, c in (SERIAL_CANDIDATES_LAST or [])]
-                )
-            except Exception:
-                top_serial_candidates = ""
-
-            # Compute total time
-            _total_time_sec = time.perf_counter() - _total_t0
-
-            # Create CSV record with standardized columns, using 'Missing' for empty values
-            csv_record = {
-                "serial_number": str(serial_num) if serial_num else "Missing",
-                "event_type": str(event_type) if event_type else "Missing",
-                "event_date": str(date) if date else "Missing",
-                "associated_name": str(name) if name else "Missing",
-                "associated_address": (
-                    str(complete_address) if complete_address else "Missing"
-                ),
-                "source_file": relative_path,
-                "file_created": metadata["file_creation_date"],
-                "file_modified": metadata["file_modification_date"],
-                # Instrumentation fields
-                "ocr_engine": _ocr_engine,
-                "ocr_device": _ocr_device,
-                "ocr_time_sec": round(_ocr_time_sec, 6),
-                "total_time_sec": round(_total_time_sec, 6),
-                "top_serial_candidates": top_serial_candidates,
-            }
-
-            csv_results.append(csv_record)
-
-            # Add extracted information to df1 (legacy format)
-            new_row = {
-                "serial_number": str(serial_num) if serial_num else None,
-                "name": str(name) if name else None,
-                "address": str(addy) if addy else None,
-                "date": str(date) if date else None,
-                "zipcode": str(zipcode) if zipcode else None,
-                "city": str(city) if city else None,
-                "state": str(state) if state else None,
-            }
-
-            # Add the row
-            df1 = pd.concat([df1, pd.DataFrame([new_row])], ignore_index=True)
-
-            # Summary
-            print("Summary...")
-            print("Serial Number:", serial_num if serial_num else "Missing")
-            print("Event Type:", event_type if event_type else "Missing")
-            print("Name:", name if name else "Missing")
-            print("Address:", complete_address if complete_address else "Missing")
-            print("Date:", date if date else "Missing")
-            print("Zipcode:", zipcode if zipcode else "Missing")
-            print("City:", city if city else "Missing")
-            print("State:", state if state else "Missing")
-            print("Matches found:", matches, "/ 7")
-
-            print("File Metadata:")
-            for key, value in metadata.items():
-                print(f"  {key}: {value}")
-
-            # Add metadata to df1 (legacy format)
-            if serial_num:
-                df1.loc[df1["serial_number"] == str(serial_num), "filename"] = metadata[
-                    "filename"
-                ]
-                df1.loc[
-                    df1["serial_number"] == str(serial_num), "file_creation_date"
-                ] = metadata["file_creation_date"]
-                df1.loc[
-                    df1["serial_number"] == str(serial_num), "file_modification_date"
-                ] = metadata["file_modification_date"]
-                df1.loc[df1["serial_number"] == str(serial_num), "file_location"] = (
-                    metadata["file_location"]
-                )
-
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    elif filename.lower().endswith(".bmp"):
-        print(f"BMP file (handled in separate cell): {filename}")
-
-    elif filename.lower().endswith(".pdf"):
-        print(f"PDF file (would need special handling): {filename}")
-
-    else:
-        print(f"Skipping non-image file: {filename}")
-
-print(f"\nProcessing complete!")
-
-# Create and save CSV results to reports folder
-if csv_results:
-    results_df = pd.DataFrame(csv_results)
-    print("\n" + "=" * 80)
-    print("NON-BMP IMAGE EXTRACTION RESULTS (CSV FORMAT)")
-    print("=" * 80)
-    print(results_df.to_csv(index=False))
-
-    # Create reports folder if it doesn't exist
-    reports_folder = os.path.join(os.getcwd(), "reports")
-    os.makedirs(reports_folder, exist_ok=True)
-
-    # Save to file in reports folder
-    output_file = os.path.join(reports_folder, "non_bmp_image_extraction_results.csv")
-    results_df.to_csv(output_file, index=False)
-    print(f"\nResults saved to: {output_file}")
-else:
-    print("\nNo results to save.")
-
-
-# %%
-# CELL 12: Build Full Image Extraction Report with All Available Fields
+# CELL 7: Build Full Image Extraction Report with All Available Fields
 
 import os
 import pandas as pd
